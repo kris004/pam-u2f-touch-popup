@@ -26,6 +26,10 @@ static void on_signal(int signum) {
     }
 }
 
+static void on_sigchld(int signum) {
+    (void)signum;
+}
+
 static const char *env_default(const char *name, const char *fallback) {
     const char *value = getenv(name);
     return (value && value[0]) ? value : fallback;
@@ -196,7 +200,7 @@ static int event_loop(const char *path, const char *parent, const char *base, co
         int rc;
 
         reap_popup();
-        rc = poll(&pfd, 1, 1000);
+        rc = poll(&pfd, 1, -1);
         if (rc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -265,6 +269,7 @@ int main(void) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGHUP, on_signal);
+    signal(SIGCHLD, on_sigchld);
 
     path = getenv("PAM_U2F_AUTHPENDING_FILE");
     if (!path || !path[0]) {
