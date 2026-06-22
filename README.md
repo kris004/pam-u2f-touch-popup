@@ -20,3 +20,6 @@ make
 The default watched path is `$XDG_RUNTIME_DIR/pam-u2f-authpending`, matching
 `pam_u2f`'s default for the current user. Override with
 `PAM_U2F_AUTHPENDING_FILE` for tests.
+
+Brief authpending opens are ignored so no-token probes do not flash a popup. The
+default delay is 250 ms; override it with `PAM_U2F_TOUCH_DELAY_MS` if needed.

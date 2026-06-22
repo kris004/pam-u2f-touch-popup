@@ -1,2 +1,4 @@
 /pam-u2f-touch-popup
 *.o
+
+/target

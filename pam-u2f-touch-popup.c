@@ -35,6 +35,45 @@ static const char *env_default(const char *name, const char *fallback) {
     return (value && value[0]) ? value : fallback;
 }
 
+static int env_delay_ms(void) {
+    const char *value = getenv("PAM_U2F_TOUCH_DELAY_MS");
+    char *end = NULL;
+    long parsed;
+
+    if (!value || !value[0]) {
+        return 250;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 5000) {
+        return 250;
+    }
+    return (int)parsed;
+}
+
+static long long monotonic_ms(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return ((long long)ts.tv_sec * 1000LL) + ((long long)ts.tv_nsec / 1000000LL);
+}
+
+static int timeout_until(long long deadline_ms) {
+    long long now = monotonic_ms();
+    long long remaining = deadline_ms - now;
+
+    if (remaining <= 0) {
+        return 0;
+    }
+    if (remaining > INT_MAX) {
+        return INT_MAX;
+    }
+    return (int)remaining;
+}
+
 static bool have_display(void) {
     const char *wayland = getenv("WAYLAND_DISPLAY");
     const char *display = getenv("DISPLAY");
@@ -149,10 +188,23 @@ static void reset_file_watch(int fd, const char *path, int *file_wd) {
     *file_wd = watch_file(fd, path);
 }
 
-static void handle_file_event(uint32_t mask, int *pending_opens, const char *title, const char *message) {
+static void handle_file_event(
+    uint32_t mask,
+    int *pending_opens,
+    bool *popup_due,
+    long long *popup_deadline_ms,
+    int delay_ms,
+    const char *title,
+    const char *message) {
     if (mask & IN_OPEN) {
         if (*pending_opens == 0) {
-            show_popup(title, message);
+            if (delay_ms == 0) {
+                show_popup(title, message);
+                *popup_due = false;
+            } else {
+                *popup_due = true;
+                *popup_deadline_ms = monotonic_ms() + delay_ms;
+            }
         }
         (*pending_opens)++;
     }
@@ -162,12 +214,14 @@ static void handle_file_event(uint32_t mask, int *pending_opens, const char *tit
             (*pending_opens)--;
         }
         if (*pending_opens == 0) {
+            *popup_due = false;
             close_popup();
         }
     }
 
     if (mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
         *pending_opens = 0;
+        *popup_due = false;
         close_popup();
     }
 }
@@ -177,6 +231,9 @@ static int event_loop(const char *path, const char *parent, const char *base, co
     int file_wd = -1;
     int dir_wd;
     int pending_opens = 0;
+    bool popup_due = false;
+    long long popup_deadline_ms = 0;
+    int delay_ms = env_delay_ms();
     char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
     struct pollfd pfd;
 
@@ -200,7 +257,11 @@ static int event_loop(const char *path, const char *parent, const char *base, co
         int rc;
 
         reap_popup();
-        rc = poll(&pfd, 1, -1);
+        if (popup_due && pending_opens > 0 && monotonic_ms() >= popup_deadline_ms) {
+            show_popup(title, message);
+            popup_due = false;
+        }
+        rc = poll(&pfd, 1, popup_due ? timeout_until(popup_deadline_ms) : -1);
         if (rc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -234,7 +295,7 @@ static int event_loop(const char *path, const char *parent, const char *base, co
                 if (event->wd == dir_wd && event->len > 0 && strcmp(event->name, base) == 0) {
                     reset_file_watch(fd, path, &file_wd);
                 } else if (event->wd == file_wd) {
-                    handle_file_event(event->mask, &pending_opens, title, message);
+                    handle_file_event(event->mask, &pending_opens, &popup_due, &popup_deadline_ms, delay_ms, title, message);
                     if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
                         file_wd = -1;
                         reset_file_watch(fd, path, &file_wd);
