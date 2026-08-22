@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Unit]
+Description=Show a prompt while pam_u2f waits for a security-key touch
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/pam-u2f-touch-popup
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target

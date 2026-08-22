@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 /pam-u2f-touch-popup
 *.o
+__pycache__/
+*.py[cod]
 
 /target
