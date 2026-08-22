@@ -20,7 +20,7 @@ jobs:
       CFLAGS: -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
       LDFLAGS: -static -s
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
