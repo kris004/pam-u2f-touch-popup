@@ -32,13 +32,27 @@ jobs:
           test -x "$stage/usr/bin/pam-u2f-touch-popup"
           grep -Fx 'ExecStart=/usr/bin/pam-u2f-touch-popup' \
             "$stage/usr/share/systemd/user/pam-u2f-touch-popup.service"
+      - name: Check release packaging
+        if: matrix.cc == 'gcc'
+        run: |
+          make \
+            VERSION=v0.0.0 \
+            RELEASE_TARGET=linux-x86_64-test \
+            dist
+          (cd dist && sha256sum --check SHA256SUMS)
+          tar -tzf \
+            dist/pam-u2f-touch-popup-0.0.0-linux-x86_64-test.tar.gz
+          tar -tzf \
+            dist/pam-u2f-touch-popup-0.0.0-src.tar.gz
 
   sanitizers:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       CC: clang
-      CFLAGS: -std=c11 -O1 -g -Wall -Wextra -Wpedantic -fno-omit-frame-pointer -fsanitize=address,undefined
+      CFLAGS: >-
+        -std=c11 -O1 -g -Wall -Wextra -Wpedantic
+        -fno-omit-frame-pointer -fsanitize=address,undefined
       LDFLAGS: -fsanitize=address,undefined
       ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
       UBSAN_OPTIONS: halt_on_error=1

@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CC: musl-gcc
+      CFLAGS: -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
+      LDFLAGS: -static -s
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Build and test static binary
+        run: |
+          make clean
+          make test
+          file pam-u2f-touch-popup | grep -F 'statically linked'
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag=v0.0.0
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            release_tag=$GITHUB_REF_NAME
+          fi
+          make VERSION="$release_tag" RELEASE_TARGET=linux-x86_64-musl dist
+          (cd dist && sha256sum --check SHA256SUMS)
+          tar -tzf dist/pam-u2f-touch-popup-*-linux-x86_64-musl.tar.gz
+          tar -tzf dist/pam-u2f-touch-popup-*-src.tar.gz
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/pam-u2f-touch-popup-*.tar.gz \
+            dist/SHA256SUMS \
+            --generate-notes \
+            --latest \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag

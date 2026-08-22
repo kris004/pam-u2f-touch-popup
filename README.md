@@ -41,6 +41,36 @@ make test
 The integration suite uses a temporary fake Zenity executable; it neither
 opens graphical dialogs nor invokes PAM.
 
+## Release downloads
+
+Each GitHub release provides:
+
+- `pam-u2f-touch-popup-VERSION-linux-x86_64-musl.tar.gz`, containing a static
+  x86-64 Linux binary and a user service laid out for `$HOME/.local`;
+- `pam-u2f-touch-popup-VERSION-src.tar.gz`, containing the exact tagged source;
+  and
+- `SHA256SUMS`, covering both archives.
+
+After downloading all three assets, verify them before installation:
+
+```sh
+sha256sum --check SHA256SUMS
+```
+
+The binary archive can be installed without root access by extracting it into
+the user-local prefix and starting the included service:
+
+```sh
+mkdir -p "$HOME/.local"
+tar -xzf pam-u2f-touch-popup-VERSION-linux-x86_64-musl.tar.gz \
+  --strip-components=1 -C "$HOME/.local"
+systemctl --user daemon-reload
+systemctl --user enable --now pam-u2f-touch-popup.service
+```
+
+Users of other architectures can build from the source archive with the
+commands below.
+
 ## Install and start
 
 The default installation is user-local and installs both the executable and a
