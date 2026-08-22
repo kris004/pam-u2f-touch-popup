@@ -276,6 +276,13 @@ def test_shutdown_closes_popup() -> None:
             os.close(fd)
 
 
+def test_idle_shutdown() -> None:
+    with running_helper() as (proc, _, _, _):
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=3)
+        assert proc.returncode == 0
+
+
 def test_missing_parent_fails_cleanly() -> None:
     with tempfile.TemporaryDirectory() as tmp_string:
         tmp = Path(tmp_string)
@@ -298,6 +305,7 @@ def main() -> int:
         test_coalesced_closes_do_not_leave_stale_popup,
         test_custom_copy,
         test_shutdown_closes_popup,
+        test_idle_shutdown,
         test_missing_parent_fails_cleanly,
     ]
     for test in tests:

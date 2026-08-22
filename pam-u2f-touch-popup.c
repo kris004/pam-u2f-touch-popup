@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,15 +19,86 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t signal_write_fd = -1;
 static pid_t popup_pid = -1;
+static int signal_pipe[2] = {-1, -1};
+
+static void wake_event_loop(void) {
+    int saved_errno = errno;
+    unsigned char byte = 0;
+
+    if (signal_write_fd >= 0) {
+        ssize_t ignored = write((int)signal_write_fd, &byte, sizeof(byte));
+
+        (void)ignored;
+    }
+    errno = saved_errno;
+}
 
 static void on_signal(int signum) {
     (void)signum;
     running = 0;
+    wake_event_loop();
 }
 
 static void on_sigchld(int signum) {
     (void)signum;
+    wake_event_loop();
+}
+
+static void close_signal_pipe(void) {
+    if (signal_pipe[1] >= 0) {
+        close(signal_pipe[1]);
+        signal_pipe[1] = -1;
+    }
+    if (signal_pipe[0] >= 0) {
+        close(signal_pipe[0]);
+        signal_pipe[0] = -1;
+    }
+}
+
+static int init_signal_pipe(void) {
+    if (pipe(signal_pipe) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < 2; i++) {
+        int status_flags = fcntl(signal_pipe[i], F_GETFL);
+        int descriptor_flags = fcntl(signal_pipe[i], F_GETFD);
+
+        if (status_flags < 0 || descriptor_flags < 0 ||
+            fcntl(signal_pipe[i], F_SETFL, status_flags | O_NONBLOCK) != 0 ||
+            fcntl(signal_pipe[i], F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
+            close_signal_pipe();
+            return -1;
+        }
+    }
+    if (signal_pipe[1] > SIG_ATOMIC_MAX) {
+        errno = EMFILE;
+        close_signal_pipe();
+        return -1;
+    }
+    signal_write_fd = (sig_atomic_t)signal_pipe[1];
+    return 0;
+}
+
+static int drain_signal_pipe(void) {
+    unsigned char buf[64];
+
+    for (;;) {
+        ssize_t len = read(signal_pipe[0], buf, sizeof(buf));
+
+        if (len > 0) {
+            continue;
+        }
+        if (len < 0 && errno == EINTR) {
+            continue;
+        }
+        if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        }
+        return -1;
+    }
 }
 
 static const char *env_default(const char *name, const char *fallback) {
@@ -79,6 +151,25 @@ static bool have_display(void) {
     return (wayland && wayland[0]) || (display && display[0]);
 }
 
+static void fill_handled_signal_set(sigset_t *set) {
+    sigemptyset(set);
+    sigaddset(set, SIGINT);
+    sigaddset(set, SIGTERM);
+    sigaddset(set, SIGHUP);
+    sigaddset(set, SIGCHLD);
+}
+
+static int reset_child_signal_handlers(void) {
+    struct sigaction action = {0};
+
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    return sigaction(SIGINT, &action, NULL) ||
+           sigaction(SIGTERM, &action, NULL) ||
+           sigaction(SIGHUP, &action, NULL) ||
+           sigaction(SIGCHLD, &action, NULL);
+}
+
 static void reap_popup(void) {
     int status;
     pid_t rc;
@@ -124,6 +215,10 @@ static void close_popup(void) {
 
 static void show_popup(const char *title, const char *message) {
     int devnull;
+    int fork_errno;
+    pid_t child_pid;
+    sigset_t handled_signals;
+    sigset_t previous_mask;
     const char *zenity = env_default("PAM_U2F_ZENITY", "zenity");
 
     reap_popup();
@@ -131,13 +226,41 @@ static void show_popup(const char *title, const char *message) {
         return;
     }
 
-    popup_pid = fork();
-    if (popup_pid < 0) {
+    fill_handled_signal_set(&handled_signals);
+    if (sigprocmask(SIG_BLOCK, &handled_signals, &previous_mask) != 0) {
+        perror("sigprocmask");
+        return;
+    }
+
+    child_pid = fork();
+    fork_errno = errno;
+    if (child_pid != 0) {
+        if (child_pid > 0) {
+            popup_pid = child_pid;
+        }
+        if (sigprocmask(SIG_SETMASK, &previous_mask, NULL) != 0) {
+            perror("sigprocmask");
+            running = 0;
+            wake_event_loop();
+            return;
+        }
+    }
+    if (child_pid < 0) {
+        errno = fork_errno;
         perror("fork");
         return;
     }
-    if (popup_pid > 0) {
+    if (child_pid > 0) {
         return;
+    }
+
+    if (reset_child_signal_handlers() != 0) {
+        _exit(127);
+    }
+    close(signal_pipe[1]);
+    close(signal_pipe[0]);
+    if (sigprocmask(SIG_SETMASK, &previous_mask, NULL) != 0) {
+        _exit(127);
     }
 
     (void)setsid();
@@ -233,7 +356,7 @@ static int event_loop(const char *parent, const char *base, const char *title, c
     long long popup_deadline_ms = 0;
     int delay_ms = env_delay_ms();
     _Alignas(struct inotify_event) char buf[4096];
-    struct pollfd pfd;
+    struct pollfd poll_fds[2];
 
     if (fd < 0) {
         perror("inotify_init1");
@@ -250,8 +373,10 @@ static int event_loop(const char *parent, const char *base, const char *title, c
         return 1;
     }
 
-    pfd.fd = fd;
-    pfd.events = POLLIN;
+    poll_fds[0].fd = fd;
+    poll_fds[0].events = POLLIN;
+    poll_fds[1].fd = signal_pipe[0];
+    poll_fds[1].events = POLLIN;
 
     while (running) {
         int rc;
@@ -261,7 +386,7 @@ static int event_loop(const char *parent, const char *base, const char *title, c
             show_popup(title, message);
             popup_due = false;
         }
-        rc = poll(&pfd, 1, popup_due ? timeout_until(popup_deadline_ms) : -1);
+        rc = poll(poll_fds, 2, popup_due ? timeout_until(popup_deadline_ms) : -1);
         if (rc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -273,10 +398,27 @@ static int event_loop(const char *parent, const char *base, const char *title, c
         if (rc == 0) {
             continue;
         }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        if (poll_fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            (void)fprintf(stderr, "pam-u2f-touch-popup: signal pipe poll failed\n");
+            failed = true;
+            break;
+        }
+        if ((poll_fds[1].revents & POLLIN) && drain_signal_pipe() != 0) {
+            perror("read signal pipe");
+            failed = true;
+            break;
+        }
+        reap_popup();
+        if (!running) {
+            break;
+        }
+        if (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             (void)fprintf(stderr, "pam-u2f-touch-popup: inotify poll failed\n");
             failed = true;
             break;
+        }
+        if (!(poll_fds[0].revents & POLLIN)) {
+            continue;
         }
 
         for (;;) {
@@ -367,6 +509,11 @@ int main(void) {
     const char *message = env_default(
         "PAM_U2F_TOUCH_MESSAGE",
         "Touch your security key to approve authentication.");
+
+    if (init_signal_pipe() != 0) {
+        perror("pipe");
+        return 1;
+    }
 
     if (install_signal_handlers() != 0) {
         perror("sigaction");
