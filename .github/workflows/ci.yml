@@ -9,8 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
+    name: Build and test (${{ matrix.cc }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -73,6 +78,7 @@ jobs:
           fi
 
   sanitizers:
+    name: Sanitizers
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -91,6 +97,7 @@ jobs:
         run: make test
 
   static-release:
+    name: Static release build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
