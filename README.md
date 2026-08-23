@@ -22,7 +22,7 @@ no-device probes do not flash a dialog.
 
 ## Requirements
 
-- Linux with inotify support
+- Linux with inotify support and procfs mounted at `/proc`
 - a C11 compiler and `make` to build
 - Python 3 to run the integration tests
 - `pam_u2f` configured for the graphical-session user
@@ -121,7 +121,10 @@ Configuration is read from the helper's environment:
 
 The default authpending path exactly matches the upstream `pam_u2f` default.
 If a PAM service sets `authpending_file` explicitly, configure the helper with
-the same path. For the systemd unit, use a drop-in:
+the same path. The file's parent must be a real directory owned by the helper's
+effective user ID, with no group or other permission bits. The default
+`/run/user/$UID` directory normally meets these requirements. For the systemd
+unit, use a drop-in:
 
 ```sh
 systemctl --user edit pam-u2f-touch-popup.service
@@ -137,6 +140,19 @@ Environment="PAM_U2F_TOUCH_MESSAGE=Touch your security key to continue."
 
 Use a portable path appropriate for the target system; the numeric path above
 is only an example.
+
+## Security model
+
+The popup is an advisory usability signal, not part of authentication and not
+proof that `pam_u2f` initiated a request. Inotify reports that the configured
+file was opened or closed, but does not authenticate the process responsible.
+
+Requiring an owner-only parent directory prevents other ordinary local users
+from reaching the watched file. A process running as the same user, or as root,
+can still open the file to spoof a popup, close it to suppress a popup, or
+replace the graphical helper. Authenticated source identity would require a
+cooperating producer and an authenticated IPC protocol rather than passive
+filesystem observation.
 
 ## Limitations
 

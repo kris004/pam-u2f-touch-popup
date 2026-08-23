@@ -355,7 +355,37 @@ def test_missing_parent_fails_cleanly() -> None:
         env["PAM_U2F_AUTHPENDING_FILE"] = str(tmp / "missing" / "authpending")
         proc = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=3, check=False)
         assert proc.returncode == 1
-        assert b"inotify_add_watch parent" in proc.stderr
+        assert b"open authpending parent" in proc.stderr
+
+
+def test_shared_parent_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp_string:
+        parent = Path(tmp_string) / "shared"
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o750)
+        pending = parent / "authpending"
+        pending.touch()
+        env = os.environ.copy()
+        env["PAM_U2F_AUTHPENDING_FILE"] = str(pending)
+        proc = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=3, check=False)
+        assert proc.returncode == 1
+        assert b"authpending parent must be an owner-only directory" in proc.stderr
+
+
+def test_symlink_parent_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp_string:
+        tmp = Path(tmp_string)
+        parent = tmp / "private"
+        parent.mkdir(mode=0o700)
+        pending = parent / "authpending"
+        pending.touch()
+        link = tmp / "parent-link"
+        link.symlink_to(parent, target_is_directory=True)
+        env = os.environ.copy()
+        env["PAM_U2F_AUTHPENDING_FILE"] = str(link / pending.name)
+        proc = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=3, check=False)
+        assert proc.returncode == 1
+        assert b"open authpending parent" in proc.stderr
 
 
 def main() -> int:
@@ -374,6 +404,8 @@ def main() -> int:
         test_cleanup_does_not_kill_unrelated_process,
         test_cleanup_kills_matching_popup,
         test_missing_parent_fails_cleanly,
+        test_shared_parent_is_rejected,
+        test_symlink_parent_is_rejected,
     ]
     for test in tests:
         test()

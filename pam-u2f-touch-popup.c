@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -438,8 +439,37 @@ static int process_inotify_buffer(
     }
 }
 
+static int open_private_parent(const char *parent) {
+    struct stat info;
+    int fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+
+    if (fd < 0) {
+        perror("open authpending parent");
+        return -1;
+    }
+    if (fstat(fd, &info) != 0) {
+        perror("fstat authpending parent");
+        close(fd);
+        return -1;
+    }
+    if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
+        (info.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        (void)fprintf(
+            stderr,
+            "pam-u2f-touch-popup: authpending parent must be an owner-only directory owned by uid %ld: %s\n",
+            (long)geteuid(),
+            parent);
+        close(fd);
+        errno = EPERM;
+        return -1;
+    }
+    return fd;
+}
+
 static int event_loop(const char *parent, const char *base, const char *title, const char *message) {
-    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    char watch_path[64];
+    int parent_fd = open_private_parent(parent);
+    int fd;
     int dir_wd;
     /* inotify coalesces identical events, so this must not be an open counter. */
     bool request_active = false;
@@ -450,15 +480,28 @@ static int event_loop(const char *parent, const char *base, const char *title, c
     unsigned char buf[4096];
     struct pollfd poll_fds[2];
 
+    if (parent_fd < 0) {
+        return 1;
+    }
+    if (snprintf(watch_path, sizeof(watch_path), "/proc/self/fd/%d", parent_fd) >=
+        (int)sizeof(watch_path)) {
+        (void)fprintf(stderr, "pam-u2f-touch-popup: authpending parent descriptor is too long\n");
+        close(parent_fd);
+        return 1;
+    }
+
+    fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (fd < 0) {
         perror("inotify_init1");
+        close(parent_fd);
         return 1;
     }
 
     dir_wd = inotify_add_watch(
         fd,
-        parent,
+        watch_path,
         IN_OPEN | IN_CLOSE | IN_DELETE | IN_MOVED_FROM | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT);
+    close(parent_fd);
     if (dir_wd < 0) {
         perror("inotify_add_watch parent");
         close(fd);
