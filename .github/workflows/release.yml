@@ -8,21 +8,32 @@ on:
       - "v*.*.*"
   workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  build:
+    name: Build release assets
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      release-artifact-id: ${{ steps.upload.outputs.artifact-id }}
     env:
       CC: musl-gcc
-      CFLAGS: -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
-      LDFLAGS: -static -s
+      CFLAGS: >-
+        -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
+        -fPIE -fstack-protector-strong
+      LDFLAGS: -static-pie -s -Wl,-z,relro,-z,now
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Validate release tag
         if: github.ref_type == 'tag'
@@ -31,16 +42,50 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
+      - name: Verify signed release tag
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref_api="repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}"
+          if [[ $(gh api "$ref_api" --jq '.object.type') != tag ]]; then
+            echo 'release tag must be an annotated tag object' >&2
+            exit 1
+          fi
+
+          tag_sha=$(gh api "$ref_api" --jq '.object.sha')
+          tag_api="repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}"
+          tag_name=$(gh api "$tag_api" --jq '.tag')
+          tag_target=$(gh api "$tag_api" --jq '.object.type')
+          if [[ "$tag_name" != "$GITHUB_REF_NAME" ||
+                "$tag_target" != commit ]]; then
+            echo 'release tag must point directly to a commit' >&2
+            exit 1
+          fi
+          verified=$(gh api "$tag_api" --jq '.verification.verified')
+          if [[ "$verified" != true ]]; then
+            reason=$(gh api "$tag_api" --jq '.verification.reason')
+            echo "release tag signature is not verified: ${reason}" >&2
+            exit 1
+          fi
+
       - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends musl-tools
+          sudo apt-get install \
+            --yes \
+            --no-install-recommends \
+            binutils \
+            file \
+            musl-tools
 
       - name: Build and test static binary
         run: |
           make clean
           make test
-          file pam-u2f-touch-popup | grep -F 'statically linked'
+          ./scripts/check-static-pie.sh pam-u2f-touch-popup
 
       - name: Package release assets
         shell: bash
@@ -55,8 +100,69 @@ jobs:
           tar -tzf dist/pam-u2f-touch-popup-*-linux-x86_64-musl.tar.gz
           tar -tzf dist/pam-u2f-touch-popup-*-src.tar.gz
 
+      - name: Upload release assets
+        id: upload
+        # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-assets
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  attest:
+    name: Attest release assets
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write # Mint a short-lived Sigstore signing identity.
+      attestations: write # Store provenance in this repository.
+      artifact-metadata: write # Record metadata for attested artifacts.
+    steps:
+      - name: Download release assets
+        # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.build.outputs.release-artifact-id }}
+          path: dist
+
+      - name: Verify release assets
+        run: (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Attest build provenance
+        # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  publish:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: [build, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # Create the GitHub release and upload its assets.
+    steps:
+      - name: Download release assets
+        # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.build.outputs.release-artifact-id }}
+          path: dist
+
+      - name: Verify release assets
+        run: (cd dist && sha256sum --check SHA256SUMS)
+
       - name: Publish GitHub release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -67,7 +67,22 @@ def terminate_process(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=3)
 
 
+def popup_identity_matches(pid: int, log: Path) -> bool:
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+
+    expected_log = os.fsencode(f"ZENITY_LOG={log}")
+    expected_script = os.fsencode(log.parent / "zenity")
+    return expected_log in environ and expected_script in command
+
+
 def cleanup_popups(log: Path) -> None:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return
+
     records = read_records(log)
     stopped = {int(record["pid"]) for record in records if record["event"] == "stop"}
     for record in records:
@@ -77,9 +92,16 @@ def cleanup_popups(log: Path) -> None:
         if pid in stopped:
             continue
         try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+            pidfd = os.pidfd_open(pid)
+        except OSError:
+            continue
+        try:
+            if popup_identity_matches(pid, log):
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        except OSError:
             pass
+        finally:
+            os.close(pidfd)
 
 
 @contextmanager
@@ -276,6 +298,56 @@ def test_shutdown_closes_popup() -> None:
             os.close(fd)
 
 
+def test_idle_shutdown() -> None:
+    with running_helper() as (proc, _, _, _):
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=3)
+        assert proc.returncode == 0
+
+
+def test_cleanup_does_not_kill_unrelated_process() -> None:
+    with tempfile.TemporaryDirectory() as tmp_string:
+        log = Path(tmp_string) / "zenity.log"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            log.write_text(json.dumps({"event": "start", "pid": proc.pid}) + "\n")
+            cleanup_popups(log)
+            time.sleep(0.05)
+            assert proc.poll() is None
+        finally:
+            terminate_process(proc)
+
+
+def test_cleanup_kills_matching_popup() -> None:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_string:
+        tmp = Path(tmp_string)
+        log = tmp / "zenity.log"
+        zenity = tmp / "zenity"
+        write_fake_zenity(zenity)
+        env = os.environ.copy()
+        env["ZENITY_LOG"] = str(log)
+        proc = subprocess.Popen(
+            [str(zenity), "--info"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert wait_for(lambda: event_count(log, "start") == 1)
+            cleanup_popups(log)
+            proc.wait(timeout=3)
+            assert proc.returncode == -signal.SIGKILL
+        finally:
+            terminate_process(proc)
+
+
 def test_missing_parent_fails_cleanly() -> None:
     with tempfile.TemporaryDirectory() as tmp_string:
         tmp = Path(tmp_string)
@@ -283,7 +355,37 @@ def test_missing_parent_fails_cleanly() -> None:
         env["PAM_U2F_AUTHPENDING_FILE"] = str(tmp / "missing" / "authpending")
         proc = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=3, check=False)
         assert proc.returncode == 1
-        assert b"inotify_add_watch parent" in proc.stderr
+        assert b"open authpending parent" in proc.stderr
+
+
+def test_shared_parent_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp_string:
+        parent = Path(tmp_string) / "shared"
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o750)
+        pending = parent / "authpending"
+        pending.touch()
+        env = os.environ.copy()
+        env["PAM_U2F_AUTHPENDING_FILE"] = str(pending)
+        proc = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=3, check=False)
+        assert proc.returncode == 1
+        assert b"authpending parent must be an owner-only directory" in proc.stderr
+
+
+def test_symlink_parent_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp_string:
+        tmp = Path(tmp_string)
+        parent = tmp / "private"
+        parent.mkdir(mode=0o700)
+        pending = parent / "authpending"
+        pending.touch()
+        link = tmp / "parent-link"
+        link.symlink_to(parent, target_is_directory=True)
+        env = os.environ.copy()
+        env["PAM_U2F_AUTHPENDING_FILE"] = str(link / pending.name)
+        proc = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=3, check=False)
+        assert proc.returncode == 1
+        assert b"open authpending parent" in proc.stderr
 
 
 def main() -> int:
@@ -298,7 +400,12 @@ def main() -> int:
         test_coalesced_closes_do_not_leave_stale_popup,
         test_custom_copy,
         test_shutdown_closes_popup,
+        test_idle_shutdown,
+        test_cleanup_does_not_kill_unrelated_process,
+        test_cleanup_kills_matching_popup,
         test_missing_parent_fails_cleanly,
+        test_shared_parent_is_rejected,
+        test_symlink_parent_is_rejected,
     ]
     for test in tests:
         test()

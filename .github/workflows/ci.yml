@@ -9,8 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
+    name: Build and test (${{ matrix.cc }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -20,7 +25,9 @@ jobs:
       CC: ${{ matrix.cc }}
       CFLAGS: -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Build
         run: make
       - name: Test
@@ -35,7 +42,11 @@ jobs:
       - name: Check release packaging
         if: matrix.cc == 'gcc'
         run: |
-          make \
+          git \
+            -c user.name='Packaging test' \
+            -c user.email='packaging-test@example.invalid' \
+            tag -a package-test-ref -m 'Packaging test ref'
+          RELEASE_REF=package-test-ref make \
             VERSION=v0.0.0 \
             RELEASE_TARGET=linux-x86_64-test \
             dist
@@ -44,8 +55,30 @@ jobs:
             dist/pam-u2f-touch-popup-0.0.0-linux-x86_64-test.tar.gz
           tar -tzf \
             dist/pam-u2f-touch-popup-0.0.0-src.tar.gz
+          before=$(sha256sum dist/*)
+          if RELEASE_REF=package-test-ref make \
+            VERSION=v0.0.0 \
+            RELEASE_TARGET=linux-x86_64-test \
+            dist; then
+            echo 'packaging unexpectedly overwrote existing assets' >&2
+            exit 1
+          fi
+          test "$before" = "$(sha256sum dist/*)"
+
+          collision_dir=$(mktemp -d)
+          trap 'rm -rf "$collision_dir"' EXIT
+          ln -s missing \
+            "$collision_dir/pam-u2f-touch-popup-0.0.0-linux-x86_64-test.tar.gz"
+          if OUTPUT_DIR="$collision_dir" RELEASE_REF=package-test-ref make \
+            VERSION=v0.0.0 \
+            RELEASE_TARGET=linux-x86_64-test \
+            dist; then
+            echo 'packaging unexpectedly replaced a dangling symlink' >&2
+            exit 1
+          fi
 
   sanitizers:
+    name: Sanitizers
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -57,6 +90,36 @@ jobs:
       ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
       UBSAN_OPTIONS: halt_on_error=1
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Build and test with sanitizers
         run: make test
+
+  static-release:
+    name: Static release build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CC: musl-gcc
+      CFLAGS: >-
+        -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
+        -fPIE -fstack-protector-strong
+      LDFLAGS: -static-pie -s -Wl,-z,relro,-z,now
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install \
+            --yes \
+            --no-install-recommends \
+            binutils \
+            file \
+            musl-tools
+      - name: Build, test, and inspect release binary
+        run: |
+          make test
+          ./scripts/check-static-pie.sh pam-u2f-touch-popup
