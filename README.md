@@ -58,6 +58,19 @@ After downloading all three assets, verify them before installation:
 sha256sum --check SHA256SUMS
 ```
 
+Releases produced by the current workflow also include signed build-provenance
+attestations. With GitHub CLI installed, verify each downloaded archive against
+this repository:
+
+```sh
+gh attestation verify \
+  pam-u2f-touch-popup-VERSION-linux-x86_64-musl.tar.gz \
+  --repo kris004/pam-u2f-touch-popup
+gh attestation verify \
+  pam-u2f-touch-popup-VERSION-src.tar.gz \
+  --repo kris004/pam-u2f-touch-popup
+```
+
 The binary archive can be installed without root access by extracting it into
 the user-local prefix and starting the included service:
 

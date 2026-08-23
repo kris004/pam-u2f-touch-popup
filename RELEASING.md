@@ -6,7 +6,8 @@ a tag runs the `Release` GitHub Actions workflow, which:
 1. builds and tests a static x86-64 Linux binary with musl;
 2. creates a binary installation archive and a tagged source archive;
 3. generates `SHA256SUMS`; and
-4. publishes the assets in a GitHub release with generated release notes.
+4. records signed build-provenance attestations for the assets; and
+5. publishes the assets in a GitHub release with generated release notes.
 
 Before tagging, confirm that `main` is clean, pushed, and passing CI. Then run:
 
