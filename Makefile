@@ -19,9 +19,11 @@ pam-u2f-touch-popup: pam-u2f-touch-popup.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 check test: pam-u2f-touch-popup
-	$(PYTHON) tests/integration.py ./pam-u2f-touch-popup
 	@tmp=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp"' 0 HUP INT TERM; \
+	$(CC) $(CPPFLAGS) -DPAM_U2F_TESTING=1 $(CFLAGS) \
+		-o "$$tmp/pam-u2f-touch-popup-test" pam-u2f-touch-popup.c $(LDFLAGS); \
+	$(PYTHON) tests/integration.py "$$tmp/pam-u2f-touch-popup-test" ./pam-u2f-touch-popup; \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o "$$tmp/inotify-decoder" tests/inotify-decoder.c $(LDFLAGS); \
 	"$$tmp/inotify-decoder"
 

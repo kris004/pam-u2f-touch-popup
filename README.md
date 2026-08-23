@@ -26,8 +26,8 @@ no-device probes do not flash a dialog.
 - a C11 compiler and `make` to build
 - Python 3 to run the integration tests
 - `pam_u2f` configured for the graphical-session user
-- Zenity available on `PATH` at runtime, or an explicit `PAM_U2F_ZENITY`
-  command or path
+- Zenity installed at `/usr/bin/zenity`, or another absolute path selected at
+  build time
 
 No library beyond libc is linked into the helper.
 
@@ -128,7 +128,6 @@ Configuration is read from the helper's environment:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PAM_U2F_AUTHPENDING_FILE` | `/var/run/user/$UID/pam-u2f-authpending` | File whose opens and closes are observed |
-| `PAM_U2F_ZENITY` | `zenity` | Zenity command name or executable path |
 | `PAM_U2F_TOUCH_DELAY_MS` | `250` | Popup delay from 0 through 5000 milliseconds; invalid values use 250 |
 | `PAM_U2F_TOUCH_TITLE` | `Security key touch required` | Dialog title |
 | `PAM_U2F_TOUCH_MESSAGE` | `Touch your security key to approve authentication.` | Dialog text |
@@ -155,11 +154,25 @@ Environment="PAM_U2F_TOUCH_MESSAGE=Touch your security key to continue."
 Use a portable path appropriate for the target system; the numeric path above
 is only an example.
 
+The popup executable is fixed at build time rather than selected from the
+service environment. Packagers whose Zenity-compatible executable is not at
+`/usr/bin/zenity` can set an absolute path while building:
+
+```sh
+make CPPFLAGS='-DPAM_U2F_ZENITY_PATH=\"/opt/bin/zenity\"'
+```
+
 ## Security model
 
 The popup is an advisory usability signal, not part of authentication and not
 proof that `pam_u2f` initiated a request. Inotify reports that the configured
 file was opened or closed, but does not authenticate the process responsible.
+
+Configuration environment variables are trusted same-user input. The popup
+executable is not configurable at runtime and is executed directly with fixed
+arguments, without a shell or `PATH` lookup. Do not install the helper setuid or
+setgid, grant it file capabilities, or launch it with elevated privileges while
+accepting an environment from a less-privileged user.
 
 Requiring an owner-only parent directory prevents other ordinary local users
 from reaching the watched file. A process running as the same user, or as root,
