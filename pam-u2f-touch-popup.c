@@ -346,6 +346,98 @@ static void handle_target_event(
     }
 }
 
+enum decode_result {
+    DECODE_DONE,
+    DECODE_EVENT,
+    DECODE_MALFORMED,
+};
+
+static enum decode_result decode_inotify_event(
+    const unsigned char *buf,
+    size_t len,
+    size_t *offset,
+    struct inotify_event *event,
+    const char **name) {
+    size_t remaining;
+
+    if (*offset == len) {
+        return DECODE_DONE;
+    }
+    if (*offset > len) {
+        return DECODE_MALFORMED;
+    }
+
+    remaining = len - *offset;
+    if (remaining < sizeof(*event)) {
+        return DECODE_MALFORMED;
+    }
+    memcpy(event, buf + *offset, sizeof(*event));
+    if ((size_t)event->len > remaining - sizeof(*event)) {
+        return DECODE_MALFORMED;
+    }
+
+    *name = NULL;
+    if (event->len > 0) {
+        *name = (const char *)(buf + *offset + sizeof(*event));
+        if (memchr(*name, '\0', event->len) == NULL) {
+            return DECODE_MALFORMED;
+        }
+    }
+
+    *offset += sizeof(*event) + (size_t)event->len;
+    return DECODE_EVENT;
+}
+
+static int process_inotify_buffer(
+    const unsigned char *buf,
+    size_t len,
+    int dir_wd,
+    const char *base,
+    bool *request_active,
+    bool *popup_due,
+    long long *popup_deadline_ms,
+    int delay_ms,
+    const char *title,
+    const char *message) {
+    size_t offset = 0;
+
+    for (;;) {
+        struct inotify_event event;
+        const char *name;
+        enum decode_result decoded = decode_inotify_event(buf, len, &offset, &event, &name);
+
+        if (decoded == DECODE_DONE) {
+            return 0;
+        }
+        if (decoded == DECODE_MALFORMED) {
+            (void)fprintf(stderr, "pam-u2f-touch-popup: malformed inotify event stream\n");
+            return -1;
+        }
+
+        if (event.mask & IN_Q_OVERFLOW) {
+            (void)fprintf(
+                stderr,
+                "pam-u2f-touch-popup: inotify event queue overflowed; resetting popup state\n");
+            *request_active = false;
+            *popup_due = false;
+            close_popup();
+        } else if (event.wd == dir_wd && name && strcmp(name, base) == 0) {
+            handle_target_event(
+                event.mask,
+                request_active,
+                popup_due,
+                popup_deadline_ms,
+                delay_ms,
+                title,
+                message);
+        } else if (event.wd == dir_wd &&
+                   (event.mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_UNMOUNT))) {
+            (void)fprintf(stderr, "pam-u2f-touch-popup: watched directory is no longer available\n");
+            return -1;
+        }
+    }
+}
+
 static int event_loop(const char *parent, const char *base, const char *title, const char *message) {
     int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     int dir_wd;
@@ -355,7 +447,7 @@ static int event_loop(const char *parent, const char *base, const char *title, c
     bool failed = false;
     long long popup_deadline_ms = 0;
     int delay_ms = env_delay_ms();
-    _Alignas(struct inotify_event) char buf[4096];
+    unsigned char buf[4096];
     struct pollfd poll_fds[2];
 
     if (fd < 0) {
@@ -423,7 +515,6 @@ static int event_loop(const char *parent, const char *base, const char *title, c
 
         for (;;) {
             ssize_t len = read(fd, buf, sizeof(buf));
-            char *ptr = buf;
 
             if (len < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -444,33 +535,20 @@ static int event_loop(const char *parent, const char *base, const char *title, c
                 break;
             }
 
-            while (ptr < buf + len) {
-                struct inotify_event *event = (struct inotify_event *)ptr;
-
-                if (event->mask & IN_Q_OVERFLOW) {
-                    (void)fprintf(
-                        stderr,
-                        "pam-u2f-touch-popup: inotify event queue overflowed; resetting popup state\n");
-                    request_active = false;
-                    popup_due = false;
-                    close_popup();
-                } else if (event->wd == dir_wd && event->len > 0 && strcmp(event->name, base) == 0) {
-                    handle_target_event(
-                        event->mask,
-                        &request_active,
-                        &popup_due,
-                        &popup_deadline_ms,
-                        delay_ms,
-                        title,
-                        message);
-                } else if (event->wd == dir_wd &&
-                           (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED | IN_UNMOUNT))) {
-                    (void)fprintf(stderr, "pam-u2f-touch-popup: watched directory is no longer available\n");
-                    failed = true;
-                    running = 0;
-                }
-
-                ptr += sizeof(struct inotify_event) + event->len;
+            if (process_inotify_buffer(
+                    buf,
+                    (size_t)len,
+                    dir_wd,
+                    base,
+                    &request_active,
+                    &popup_due,
+                    &popup_deadline_ms,
+                    delay_ms,
+                    title,
+                    message) != 0) {
+                failed = true;
+                running = 0;
+                break;
             }
         }
     }

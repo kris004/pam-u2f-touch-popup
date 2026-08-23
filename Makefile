@@ -20,6 +20,10 @@ pam-u2f-touch-popup: pam-u2f-touch-popup.c
 
 check test: pam-u2f-touch-popup
 	$(PYTHON) tests/integration.py ./pam-u2f-touch-popup
+	@tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' 0 HUP INT TERM; \
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o "$$tmp/inotify-decoder" tests/inotify-decoder.c $(LDFLAGS); \
+	"$$tmp/inotify-decoder"
 
 dist: pam-u2f-touch-popup
 	@test -n "$(VERSION)" || { echo "VERSION is required (for example, VERSION=v0.1.0)" >&2; exit 2; }
