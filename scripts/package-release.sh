@@ -45,7 +45,7 @@ readonly source_archive="${program}-${version}-src.tar.gz"
 
 source_date_epoch=${SOURCE_DATE_EPOCH:-}
 if [[ -z ${source_date_epoch} ]]; then
-  source_date_epoch=$(git show -s --format=%ct "${release_ref}")
+  source_date_epoch=$(git show -s --format=%ct "${release_ref}^{commit}")
 fi
 readonly source_date_epoch
 

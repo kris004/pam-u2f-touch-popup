@@ -37,7 +37,11 @@ jobs:
       - name: Check release packaging
         if: matrix.cc == 'gcc'
         run: |
-          make \
+          git \
+            -c user.name='Packaging test' \
+            -c user.email='packaging-test@example.invalid' \
+            tag -a package-test-ref -m 'Packaging test ref'
+          RELEASE_REF=package-test-ref make \
             VERSION=v0.0.0 \
             RELEASE_TARGET=linux-x86_64-test \
             dist
