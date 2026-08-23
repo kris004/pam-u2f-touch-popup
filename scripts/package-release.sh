@@ -12,6 +12,7 @@ Usage: scripts/package-release.sh vMAJOR.MINOR.PATCH TARGET
 Environment:
   BINARY            Executable to package (default: ./pam-u2f-touch-popup)
   OUTPUT_DIR        Artifact directory (default: dist)
+                    Existing output files are never overwritten
   RELEASE_REF       Git object for the source archive (default: HEAD)
   SOURCE_DATE_EPOCH Archive timestamp (default: RELEASE_REF commit time)
 EOF
@@ -42,6 +43,7 @@ readonly archive_root="${program}-${version}-${target}"
 readonly binary_archive="${archive_root}.tar.gz"
 readonly source_root="${program}-${version}"
 readonly source_archive="${program}-${version}-src.tar.gz"
+readonly checksums='SHA256SUMS'
 
 source_date_epoch=${SOURCE_DATE_EPOCH:-}
 if [[ -z ${source_date_epoch} ]]; then
@@ -87,16 +89,25 @@ git archive \
   "${release_ref}" \
   | gzip -n >"${tmp_dir}/${source_archive}"
 
+(
+  cd "${tmp_dir}"
+  sha256sum "${binary_archive}" "${source_archive}" >"${checksums}"
+)
+
 install -d "${output_dir}"
+for artifact in "${binary_archive}" "${source_archive}" "${checksums}"; do
+  destination="${output_dir}/${artifact}"
+  if [[ -e ${destination} || -L ${destination} ]]; then
+    echo "refusing to overwrite existing release artifact: ${destination}" >&2
+    exit 1
+  fi
+done
+
 install -m0644 "${tmp_dir}/${binary_archive}" "${output_dir}/${binary_archive}"
 install -m0644 "${tmp_dir}/${source_archive}" "${output_dir}/${source_archive}"
-
-(
-  cd "${output_dir}"
-  sha256sum "${binary_archive}" "${source_archive}" >SHA256SUMS
-)
+install -m0644 "${tmp_dir}/${checksums}" "${output_dir}/${checksums}"
 
 printf 'Created %s\n' \
   "${output_dir}/${binary_archive}" \
   "${output_dir}/${source_archive}" \
-  "${output_dir}/SHA256SUMS"
+  "${output_dir}/${checksums}"
