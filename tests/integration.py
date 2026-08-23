@@ -17,6 +17,7 @@ from typing import Iterator
 
 
 BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else "./pam-u2f-touch-popup").resolve()
+PRODUCTION_BINARY = Path(sys.argv[2] if len(sys.argv) > 2 else BINARY).resolve()
 
 
 def wait_for(predicate, timeout: float = 2.0) -> bool:
@@ -233,6 +234,67 @@ def test_no_display_does_not_spawn_popup() -> None:
         assert read_records(log) == []
 
 
+def test_test_backend_requires_absolute_zenity_override() -> None:
+    env = os.environ.copy()
+    env["PAM_U2F_ZENITY"] = "zenity"
+    proc = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=3, check=False)
+    assert proc.returncode == 1
+    assert b"Zenity executable must be an absolute path" in proc.stderr
+
+
+def test_production_rejects_runtime_zenity_override() -> None:
+    env = os.environ.copy()
+    env["PAM_U2F_ZENITY"] = "/tmp/zenity"
+    proc = subprocess.run(
+        [str(PRODUCTION_BINARY)], env=env, capture_output=True, timeout=3, check=False
+    )
+    assert proc.returncode == 1
+    assert b"PAM_U2F_ZENITY is test-only" in proc.stderr
+
+
+def test_default_zenity_does_not_search_path() -> None:
+    with tempfile.TemporaryDirectory() as tmp_string:
+        tmp = Path(tmp_string)
+        pending = tmp / "pam-u2f-authpending"
+        pending.touch()
+        log = tmp / "zenity.log"
+        fake_zenity = tmp / "zenity"
+        write_fake_zenity(fake_zenity)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PAM_U2F_AUTHPENDING_FILE": str(pending),
+                "PAM_U2F_TOUCH_DELAY_MS": "0",
+                "PATH": f"{tmp}{os.pathsep}{env.get('PATH', '')}",
+                "WAYLAND_DISPLAY": "wayland-test",
+                "ZENITY_LOG": str(log),
+            }
+        )
+        env.pop("DISPLAY", None)
+        env.pop("PAM_U2F_ZENITY", None)
+        proc = subprocess.Popen(
+            [str(BINARY)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+                raise AssertionError(f"helper exited early ({proc.returncode}): {stderr}")
+            fd = open_pending(pending)
+            try:
+                time.sleep(0.3)
+                assert not log.exists()
+            finally:
+                os.close(fd)
+        finally:
+            terminate_process(proc)
+            cleanup_popups(log)
+
+
 def test_delete_and_recreate_resets_state() -> None:
     with running_helper() as (_, pending, log, _):
         first_fd = open_pending(pending)
@@ -396,6 +458,9 @@ def main() -> int:
         test_long_open_survives_debounce,
         test_unrelated_file_is_ignored,
         test_no_display_does_not_spawn_popup,
+        test_test_backend_requires_absolute_zenity_override,
+        test_production_rejects_runtime_zenity_override,
+        test_default_zenity_does_not_search_path,
         test_delete_and_recreate_resets_state,
         test_coalesced_closes_do_not_leave_stale_popup,
         test_custom_copy,

@@ -19,6 +19,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef PAM_U2F_ZENITY_PATH
+#define PAM_U2F_ZENITY_PATH "/usr/bin/zenity"
+#endif
+
 static volatile sig_atomic_t running = 1;
 static volatile sig_atomic_t signal_write_fd = -1;
 static pid_t popup_pid = -1;
@@ -214,14 +218,12 @@ static void close_popup(void) {
     } while (rc < 0 && errno == EINTR);
 }
 
-static void show_popup(const char *title, const char *message) {
+static void show_popup(const char *zenity, const char *title, const char *message) {
     int devnull;
     int fork_errno;
     pid_t child_pid;
     sigset_t handled_signals;
     sigset_t previous_mask;
-    const char *zenity = env_default("PAM_U2F_ZENITY", "zenity");
-
     reap_popup();
     if (popup_pid > 0 || !have_display()) {
         return;
@@ -273,7 +275,7 @@ static void show_popup(const char *title, const char *message) {
         close(devnull);
     }
 
-    execlp(
+    execl(
         zenity,
         "zenity",
         "--info",
@@ -315,6 +317,7 @@ static void handle_target_event(
     bool *popup_due,
     long long *popup_deadline_ms,
     int delay_ms,
+    const char *zenity,
     const char *title,
     const char *message) {
     if (mask & IN_ISDIR) {
@@ -325,7 +328,7 @@ static void handle_target_event(
         if (!*request_active) {
             *request_active = true;
             if (delay_ms == 0) {
-                show_popup(title, message);
+                show_popup(zenity, title, message);
                 *popup_due = false;
             } else {
                 *popup_due = true;
@@ -398,6 +401,7 @@ static int process_inotify_buffer(
     bool *popup_due,
     long long *popup_deadline_ms,
     int delay_ms,
+    const char *zenity,
     const char *title,
     const char *message) {
     size_t offset = 0;
@@ -429,6 +433,7 @@ static int process_inotify_buffer(
                 popup_due,
                 popup_deadline_ms,
                 delay_ms,
+                zenity,
                 title,
                 message);
         } else if (event.wd == dir_wd &&
@@ -466,7 +471,12 @@ static int open_private_parent(const char *parent) {
     return fd;
 }
 
-static int event_loop(const char *parent, const char *base, const char *title, const char *message) {
+static int event_loop(
+    const char *parent,
+    const char *base,
+    const char *zenity,
+    const char *title,
+    const char *message) {
     char watch_path[64];
     int parent_fd = open_private_parent(parent);
     int fd;
@@ -518,7 +528,7 @@ static int event_loop(const char *parent, const char *base, const char *title, c
 
         reap_popup();
         if (popup_due && request_active && monotonic_ms() >= popup_deadline_ms) {
-            show_popup(title, message);
+            show_popup(zenity, title, message);
             popup_due = false;
         }
         rc = poll(poll_fds, 2, popup_due ? timeout_until(popup_deadline_ms) : -1);
@@ -587,6 +597,7 @@ static int event_loop(const char *parent, const char *base, const char *title, c
                     &popup_due,
                     &popup_deadline_ms,
                     delay_ms,
+                    zenity,
                     title,
                     message) != 0) {
                 failed = true;
@@ -626,10 +637,27 @@ int main(void) {
     char parent[PATH_MAX];
     const char *base = NULL;
     const char *path;
+    const char *zenity;
     const char *title = env_default("PAM_U2F_TOUCH_TITLE", "Security key touch required");
     const char *message = env_default(
         "PAM_U2F_TOUCH_MESSAGE",
         "Touch your security key to approve authentication.");
+
+#ifdef PAM_U2F_TESTING
+    zenity = env_default("PAM_U2F_ZENITY", PAM_U2F_ZENITY_PATH);
+#else
+    if (getenv("PAM_U2F_ZENITY") != NULL) {
+        (void)fprintf(
+            stderr,
+            "pam-u2f-touch-popup: PAM_U2F_ZENITY is test-only; configure the executable at build time\n");
+        return 1;
+    }
+    zenity = PAM_U2F_ZENITY_PATH;
+#endif
+    if (zenity[0] != '/') {
+        (void)fprintf(stderr, "pam-u2f-touch-popup: Zenity executable must be an absolute path\n");
+        return 1;
+    }
 
     if (init_signal_pipe() != 0) {
         perror("pipe");
@@ -656,5 +684,5 @@ int main(void) {
         return 1;
     }
 
-    return event_loop(parent, base, title, message);
+    return event_loop(parent, base, zenity, title, message);
 }
