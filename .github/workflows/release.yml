@@ -42,6 +42,35 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
+      - name: Verify signed release tag
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref_api="repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}"
+          if [[ $(gh api "$ref_api" --jq '.object.type') != tag ]]; then
+            echo 'release tag must be an annotated tag object' >&2
+            exit 1
+          fi
+
+          tag_sha=$(gh api "$ref_api" --jq '.object.sha')
+          tag_api="repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}"
+          tag_name=$(gh api "$tag_api" --jq '.tag')
+          tag_target=$(gh api "$tag_api" --jq '.object.type')
+          if [[ "$tag_name" != "$GITHUB_REF_NAME" ||
+                "$tag_target" != commit ]]; then
+            echo 'release tag must point directly to a commit' >&2
+            exit 1
+          fi
+          verified=$(gh api "$tag_api" --jq '.verification.verified')
+          if [[ "$verified" != true ]]; then
+            reason=$(gh api "$tag_api" --jq '.verification.reason')
+            echo "release tag signature is not verified: ${reason}" >&2
+            exit 1
+          fi
+
       - name: Install musl toolchain
         run: |
           sudo apt-get update
