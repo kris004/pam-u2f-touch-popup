@@ -17,8 +17,10 @@ jobs:
     timeout-minutes: 15
     env:
       CC: musl-gcc
-      CFLAGS: -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
-      LDFLAGS: -static -s
+      CFLAGS: >-
+        -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
+        -fPIE -fstack-protector-strong
+      LDFLAGS: -static-pie -s -Wl,-z,relro,-z,now
     steps:
       - uses: actions/checkout@v6
         with:
@@ -34,13 +36,18 @@ jobs:
       - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends musl-tools
+          sudo apt-get install \
+            --yes \
+            --no-install-recommends \
+            binutils \
+            file \
+            musl-tools
 
       - name: Build and test static binary
         run: |
           make clean
           make test
-          file pam-u2f-touch-popup | grep -F 'statically linked'
+          ./scripts/check-static-pie.sh pam-u2f-touch-popup
 
       - name: Package release assets
         shell: bash

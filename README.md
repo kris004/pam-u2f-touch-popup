@@ -46,7 +46,8 @@ opens graphical dialogs nor invokes PAM.
 Each GitHub release provides:
 
 - `pam-u2f-touch-popup-VERSION-linux-x86_64-musl.tar.gz`, containing a static
-  x86-64 Linux binary and a user service laid out for `$HOME/.local`;
+  position-independent x86-64 Linux binary and a user service laid out for
+  `$HOME/.local`;
 - `pam-u2f-touch-popup-VERSION-src.tar.gz`, containing the exact tagged source;
   and
 - `SHA256SUMS`, covering both archives.
