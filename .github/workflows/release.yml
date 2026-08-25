@@ -171,5 +171,6 @@ jobs:
             dist/SHA256SUMS \
             --generate-notes \
             --latest \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --verify-tag
