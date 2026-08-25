@@ -35,10 +35,15 @@ jobs:
       - name: Check staged installation
         run: |
           stage="$(mktemp -d)"
-          make DESTDIR="$stage" PREFIX=/usr install
-          test -x "$stage/usr/bin/pam-u2f-touch-popup"
-          grep -Fx 'ExecStart=/usr/bin/pam-u2f-touch-popup' \
-            "$stage/usr/share/systemd/user/pam-u2f-touch-popup.service"
+          make \
+            DESTDIR="$stage" \
+            PREFIX=/usr \
+            BINDIR=/usr/libexec \
+            UNITDIR=/usr/lib/systemd/user \
+            install
+          test -x "$stage/usr/libexec/pam-u2f-touch-popup"
+          grep -Fx 'ExecStart=/usr/libexec/pam-u2f-touch-popup' \
+            "$stage/usr/lib/systemd/user/pam-u2f-touch-popup.service"
       - name: Check release packaging
         if: matrix.cc == 'gcc'
         run: |
