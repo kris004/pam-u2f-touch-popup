@@ -101,12 +101,23 @@ The defaults are:
 - executable: `$HOME/.local/bin/pam-u2f-touch-popup`
 - user unit: `$HOME/.local/share/systemd/user/pam-u2f-touch-popup.service`
 
-Packagers can stage a system installation without embedding the staging path
-in the service:
+Packagers can override the executable and user-unit directories while staging
+a system installation. For example, the following uses conventional
+distribution paths without embedding the staging root in the service:
 
 ```sh
-make DESTDIR=/tmp/package-root PREFIX=/usr install
+make \
+  DESTDIR=/tmp/package-root \
+  PREFIX=/usr \
+  BINDIR=/usr/libexec \
+  UNITDIR=/usr/lib/systemd/user \
+  install
 ```
+
+`BINDIR` is embedded in the unit's `ExecStart=` setting. `UNITDIR` only
+controls where the unit is installed. Distribution packages should use their
+package-manager helpers to select the native libexec and systemd user-unit
+directories.
 
 The service is tied to `graphical-session.target`. Desktop environments usually
 import `DISPLAY` or `WAYLAND_DISPLAY` into the systemd user manager. Minimal
