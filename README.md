@@ -46,7 +46,8 @@ opens graphical dialogs nor invokes PAM.
 Each GitHub release provides:
 
 - `pam-u2f-touch-popup-VERSION-linux-x86_64-musl.tar.gz`, containing a static
-  position-independent x86-64 Linux binary and a user service laid out for
+  position-independent x86-64 Linux binary, the default and optional
+  device-gated user units, and an example udev rule laid out for
   `$HOME/.local`;
 - `pam-u2f-touch-popup-VERSION-src.tar.gz`, containing the exact tagged source;
   and
@@ -99,11 +100,15 @@ systemctl --user enable --now pam-u2f-touch-popup.service
 The defaults are:
 
 - executable: `$HOME/.local/bin/pam-u2f-touch-popup`
-- user unit: `$HOME/.local/share/systemd/user/pam-u2f-touch-popup.service`
+- user units: `$HOME/.local/share/systemd/user/pam-u2f-touch-popup*.service`
+  and `$HOME/.local/share/systemd/user/pam-u2f-touch-popup-device.path`
+- optional udev example:
+  `$HOME/.local/share/doc/pam-u2f-touch-popup/examples/70-pam-u2f-touch-popup-device-gate.rules`
 
-Packagers can override the executable and user-unit directories while staging
-a system installation. For example, the following uses conventional
-distribution paths without embedding the staging root in the service:
+Packagers can override the executable, user-unit, and documentation directories
+while staging a system installation. For example, the following uses
+conventional distribution paths without embedding the staging root in the
+service:
 
 ```sh
 make \
@@ -111,13 +116,14 @@ make \
   PREFIX=/usr \
   BINDIR=/usr/libexec \
   UNITDIR=/usr/lib/systemd/user \
+  DOCDIR=/usr/share/doc/pam-u2f-touch-popup \
   install
 ```
 
-`BINDIR` is embedded in the unit's `ExecStart=` setting. `UNITDIR` only
-controls where the unit is installed. Distribution packages should use their
-package-manager helpers to select the native libexec and systemd user-unit
-directories.
+`BINDIR` is embedded in each service's `ExecStart=` setting. `UNITDIR` and
+`DOCDIR` only control where files are installed. Distribution packages should
+use their package-manager helpers to select the native libexec, systemd
+user-unit, and documentation directories.
 
 The service is tied to `graphical-session.target`. Desktop environments usually
 import `DISPLAY` or `WAYLAND_DISPLAY` into the systemd user manager. Minimal
@@ -131,6 +137,70 @@ systemctl --user restart pam-u2f-touch-popup.service
 
 Without systemd, start `pam-u2f-touch-popup` from the graphical session's
 autostart mechanism.
+
+### Optional device-presence gate
+
+Nothing in this section is required on a system where every connected FIDO
+authenticator should use the popup. The default
+`pam-u2f-touch-popup.service` remains the normal setup.
+
+On a system with multiple authenticator models, the optional gate keeps the
+helper stopped unless a selected model is present. An example udev rule exposes
+the selected FIDO device as `/dev/pam-u2f-touch-popup-key`; a path unit starts
+the alternate service when that path appears, and the service's device binding
+stops it when the device is unplugged. Device selection therefore does not
+depend on the popup delay.
+
+The installed example selects the Yubico USB ID `1050:0402`. To select a
+different model, find the FIDO hidraw node and inspect its parent attributes:
+
+```sh
+udevadm info --query=property --name=/dev/hidrawN
+udevadm info --attribute-walk --name=/dev/hidrawN
+```
+
+Copy the example into the system udev configuration, edit `idVendor` and
+`idProduct` if necessary, reload udev, and reconnect the selected key:
+
+```sh
+sudo install -Dm644 \
+  "$HOME/.local/share/doc/pam-u2f-touch-popup/examples/70-pam-u2f-touch-popup-device-gate.rules" \
+  /etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules
+sudoedit /etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules
+sudo udevadm control --reload
+```
+
+Then replace the default service with the gated path unit. Do not enable both
+services, because two helpers would watch the same authpending file.
+
+```sh
+systemctl --user daemon-reload
+systemctl --user disable --now pam-u2f-touch-popup.service
+systemctl --user enable --now pam-u2f-touch-popup-device.path
+```
+
+The path unit remains active. The device service should be inactive without a
+matching key, active after that key is connected, and inactive again after it
+is unplugged:
+
+```sh
+systemctl --user status pam-u2f-touch-popup-device.path
+systemctl --user status pam-u2f-touch-popup-device.service
+```
+
+The example matches a model by USB vendor and product ID. Every key with those
+IDs will match. Selecting one physical unit additionally requires a stable
+serial attribute and a corresponding `ATTRS{serial}==` match; not all
+authenticators expose a USB serial number.
+
+To return to the default behavior:
+
+```sh
+systemctl --user disable --now pam-u2f-touch-popup-device.path
+systemctl --user enable --now pam-u2f-touch-popup.service
+sudo rm /etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules
+sudo udevadm control --reload
+```
 
 ## Configuration
 
@@ -148,7 +218,8 @@ If a PAM service sets `authpending_file` explicitly, configure the helper with
 the same path. The file's parent must be a real directory owned by the helper's
 effective user ID, with no group or other permission bits. The default
 `/run/user/$UID` directory normally meets these requirements. For the systemd
-unit, use a drop-in:
+unit, use a drop-in. When the optional gate is enabled, edit
+`pam-u2f-touch-popup-device.service` instead:
 
 ```sh
 systemctl --user edit pam-u2f-touch-popup.service
@@ -196,6 +267,11 @@ filesystem observation.
 
 - The helper must already be running when `pam_u2f` opens the file. Inotify
   cannot report an open that predates the watcher.
+- After connecting a key selected by the optional device gate, the device
+  service must finish starting before an authentication request opens the
+  authpending file. This normally happens before a person can begin the
+  request, but software that starts authentication immediately on hotplug can
+  still race the watcher.
 - One authpending file represents one active request at a time. Linux may
   coalesce identical inotify events, so overlapping PAM conversations using the
   same file cannot be counted reliably. With overlapping requests, the dialog
@@ -209,7 +285,12 @@ reset the popup state rather than leaving a stale dialog behind.
 
 ## Uninstall
 
+If the optional device gate is enabled, disable its path unit and remove the
+udev rule copied into `/etc/udev/rules.d` first. `make uninstall` only removes
+files installed below its configured prefix.
+
 ```sh
+systemctl --user disable --now pam-u2f-touch-popup-device.path
 systemctl --user disable --now pam-u2f-touch-popup.service
 make uninstall
 systemctl --user daemon-reload

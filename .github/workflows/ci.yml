@@ -40,10 +40,17 @@ jobs:
             PREFIX=/usr \
             BINDIR=/usr/libexec \
             UNITDIR=/usr/lib/systemd/user \
+            DOCDIR=/usr/share/doc/pam-u2f-touch-popup \
             install
           test -x "$stage/usr/libexec/pam-u2f-touch-popup"
           grep -Fx 'ExecStart=/usr/libexec/pam-u2f-touch-popup' \
             "$stage/usr/lib/systemd/user/pam-u2f-touch-popup.service"
+          grep -Fx 'ExecStart=/usr/libexec/pam-u2f-touch-popup' \
+            "$stage/usr/lib/systemd/user/pam-u2f-touch-popup-device.service"
+          grep -Fx 'PathExists=/dev/pam-u2f-touch-popup-key' \
+            "$stage/usr/lib/systemd/user/pam-u2f-touch-popup-device.path"
+          test -f \
+            "$stage/usr/share/doc/pam-u2f-touch-popup/examples/70-pam-u2f-touch-popup-device-gate.rules"
       - name: Check release packaging
         if: matrix.cc == 'gcc'
         run: |
@@ -56,10 +63,24 @@ jobs:
             RELEASE_TARGET=linux-x86_64-test \
             dist
           (cd dist && sha256sum --check SHA256SUMS)
-          tar -tzf \
-            dist/pam-u2f-touch-popup-0.0.0-linux-x86_64-test.tar.gz
-          tar -tzf \
-            dist/pam-u2f-touch-popup-0.0.0-src.tar.gz
+          binary_archive=dist/pam-u2f-touch-popup-0.0.0-linux-x86_64-test.tar.gz
+          source_archive=dist/pam-u2f-touch-popup-0.0.0-src.tar.gz
+          tar -tzf "$binary_archive" > binary-archive.list
+          tar -tzf "$source_archive" > source-archive.list
+          cat binary-archive.list
+          cat source-archive.list
+          grep -Fqx \
+            'pam-u2f-touch-popup-0.0.0-linux-x86_64-test/share/systemd/user/pam-u2f-touch-popup-device.path' \
+            binary-archive.list
+          grep -Fqx \
+            'pam-u2f-touch-popup-0.0.0-linux-x86_64-test/share/systemd/user/pam-u2f-touch-popup-device.service' \
+            binary-archive.list
+          grep -Fqx \
+            'pam-u2f-touch-popup-0.0.0-linux-x86_64-test/share/doc/pam-u2f-touch-popup/examples/70-pam-u2f-touch-popup-device-gate.rules' \
+            binary-archive.list
+          grep -Fqx \
+            'pam-u2f-touch-popup-0.0.0/examples/70-pam-u2f-touch-popup-device-gate.rules' \
+            source-archive.list
           before=$(sha256sum dist/*)
           if RELEASE_REF=package-test-ref make \
             VERSION=v0.0.0 \

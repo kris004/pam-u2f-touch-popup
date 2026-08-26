@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Optional example: expose Yubico 1050:0402 as the key that enables the popup.
+# Copy this file to /etc/udev/rules.d/ and change both IDs when selecting a
+# different FIDO authenticator model.
+
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ENV{ID_FIDO_TOKEN}=="1", \
+  ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0402", TAG+="systemd", \
+  SYMLINK+="pam-u2f-touch-popup-key", \
+  ENV{SYSTEMD_ALIAS}+="/dev/pam-u2f-touch-popup-key"

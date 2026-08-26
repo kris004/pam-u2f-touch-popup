@@ -68,10 +68,17 @@ readonly package_dir="${tmp_dir}/${archive_root}"
 install -Dm755 "${binary}" "${package_dir}/bin/${program}"
 install -Dm644 README.md "${package_dir}/share/doc/${program}/README.md"
 install -Dm644 LICENSE "${package_dir}/share/doc/${program}/LICENSE"
+install -Dm644 examples/70-pam-u2f-touch-popup-device-gate.rules \
+  "${package_dir}/share/doc/${program}/examples/70-pam-u2f-touch-popup-device-gate.rules"
 install -d "${package_dir}/share/systemd/user"
 sed 's|@BINDIR@|%h/.local/bin|g' pam-u2f-touch-popup.service.in \
   >"${package_dir}/share/systemd/user/${program}.service"
 chmod 0644 "${package_dir}/share/systemd/user/${program}.service"
+sed 's|@BINDIR@|%h/.local/bin|g' pam-u2f-touch-popup-device.service.in \
+  >"${package_dir}/share/systemd/user/${program}-device.service"
+chmod 0644 "${package_dir}/share/systemd/user/${program}-device.service"
+install -Dm644 pam-u2f-touch-popup-device.path \
+  "${package_dir}/share/systemd/user/${program}-device.path"
 
 tar \
   --sort=name \

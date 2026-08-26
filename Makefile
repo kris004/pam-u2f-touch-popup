@@ -8,6 +8,7 @@ PYTHON ?= python3
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 UNITDIR ?= $(PREFIX)/share/systemd/user
+DOCDIR ?= $(PREFIX)/share/doc/pam-u2f-touch-popup
 VERSION ?=
 RELEASE_TARGET ?= linux-$(shell uname -m)
 
@@ -35,10 +36,17 @@ install: pam-u2f-touch-popup
 	install -Dm755 pam-u2f-touch-popup $(DESTDIR)$(BINDIR)/pam-u2f-touch-popup
 	install -Dm644 pam-u2f-touch-popup.service.in $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup.service
 	sed -i 's|@BINDIR@|$(BINDIR)|g' $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup.service
+	install -Dm644 pam-u2f-touch-popup-device.service.in $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup-device.service
+	sed -i 's|@BINDIR@|$(BINDIR)|g' $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup-device.service
+	install -Dm644 pam-u2f-touch-popup-device.path $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup-device.path
+	install -Dm644 examples/70-pam-u2f-touch-popup-device-gate.rules $(DESTDIR)$(DOCDIR)/examples/70-pam-u2f-touch-popup-device-gate.rules
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/pam-u2f-touch-popup
 	rm -f $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup.service
+	rm -f $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup-device.service
+	rm -f $(DESTDIR)$(UNITDIR)/pam-u2f-touch-popup-device.path
+	rm -f $(DESTDIR)$(DOCDIR)/examples/70-pam-u2f-touch-popup-device-gate.rules
 
 clean:
 	rm -f pam-u2f-touch-popup
