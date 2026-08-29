@@ -362,7 +362,11 @@ def test_production_ignores_path_override() -> None:
             timeout=5,
             check=False,
         )
-        assert result.returncode == 0, result.stderr
+        if os.geteuid() == 0:
+            assert result.returncode == 1
+            assert "run this command as the desktop user" in result.stderr
+        else:
+            assert result.returncode == 0, result.stderr
         assert not marker.exists()
 
 

@@ -32,6 +32,9 @@ jobs:
         run: make
       - name: Test
         run: make test
+      - name: Test setup harness as root
+        if: matrix.cc == 'gcc'
+        run: sudo python3 tests/setup.py ./pam-u2f-touch-popup-setup
       - name: Check staged installation
         run: |
           stage="$(mktemp -d)"
