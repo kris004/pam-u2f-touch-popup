@@ -73,8 +73,16 @@ esac
 set -euo pipefail
 printf 'systemctl %s\\n' "$*" >>"${PAM_TEST_COMMAND_LOG}"
 arguments=" $* "
+if [[ ${arguments} == *' is-active --quiet pam-u2f-touch-popup-device.service '* ]]; then
+  [[ ${PAM_TEST_DEVICE_ACTIVE:-1} == 1 ]]
+  exit
+fi
 if [[ ${arguments} == *' enable --now pam-u2f-touch-popup-device.path '* &&
       ${PAM_TEST_FAIL_DEVICE_ENABLE:-0} == 1 ]]; then
+  exit 1
+fi
+if [[ ${arguments} == *' try-restart pam-u2f-touch-popup-device.service '* &&
+      ${PAM_TEST_FAIL_DEVICE_RESTART:-0} == 1 ]]; then
   exit 1
 fi
 case ${arguments} in
@@ -184,7 +192,12 @@ def test_enable_generates_rule_and_switches_units() -> None:
             for index, command in enumerate(commands)
             if "enable --now pam-u2f-touch-popup-device.path" in command
         )
-        assert disable_index < enable_index
+        restart_index = next(
+            index
+            for index, command in enumerate(commands)
+            if "try-restart pam-u2f-touch-popup-device.service" in command
+        )
+        assert disable_index < enable_index < restart_index
         assert any(command == "sudo -v" for command in commands)
         assert any("udevadm control --reload" in command for command in commands)
         assert any("udevadm trigger --action=change --subsystem-match=hidraw" in command for command in commands)
@@ -226,6 +239,37 @@ def test_enable_restores_default_service_on_failure() -> None:
         assert harness.rule.exists()
         assert any(
             "enable --now pam-u2f-touch-popup.service" in command
+            for command in harness.commands()
+        )
+
+
+def test_enable_reports_device_restart_failure() -> None:
+    temporary_directory, harness = new_harness()
+    with temporary_directory:
+        result = harness.run(
+            "enable",
+            "--yes",
+            "1050:0402",
+            env={"PAM_TEST_FAIL_DEVICE_RESTART": "1"},
+        )
+        assert result.returncode == 1
+        assert "device gating is enabled" in result.stderr
+        assert "could not be restarted" in result.stderr
+        assert harness.rule.exists()
+
+
+def test_enable_does_not_start_inactive_device_service_directly() -> None:
+    temporary_directory, harness = new_harness()
+    with temporary_directory:
+        result = harness.run(
+            "enable",
+            "--yes",
+            "1050:0402",
+            env={"PAM_TEST_DEVICE_ACTIVE": "0"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert not any(
+            "try-restart pam-u2f-touch-popup-device.service" in command
             for command in harness.commands()
         )
 
@@ -379,6 +423,8 @@ def main() -> int:
         test_enable_autoselects_only_connected_model,
         test_enable_rejects_invalid_device_id,
         test_enable_restores_default_service_on_failure,
+        test_enable_reports_device_restart_failure,
+        test_enable_does_not_start_inactive_device_service_directly,
         test_enable_refuses_unrelated_rule,
         test_disable_restores_default_and_removes_rule,
         test_status_reports_marker_and_units,

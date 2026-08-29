@@ -309,6 +309,7 @@ command_enable() {
   local assume_yes=false
   local requested_id=
   local arg systemctl_cmd udevadm_cmd sudo_cmd install_cmd
+  local restart_device_service=false
 
   selected_device_id=
 
@@ -332,6 +333,9 @@ command_enable() {
     die "${device_path_unit} is not installed"
   systemctl_user "${systemctl_cmd}" cat "${device_service}" >/dev/null 2>&1 || \
     die "${device_service} is not installed"
+  if systemctl_user "${systemctl_cmd}" is-active --quiet "${device_service}"; then
+    restart_device_service=true
+  fi
 
   if [[ -n ${requested_id} ]]; then
     selected_device_id=$(normalize_device_id "${requested_id}")
@@ -360,6 +364,10 @@ command_enable() {
     systemctl_user "${systemctl_cmd}" enable --now "${default_service}" || \
       warn "automatic rollback also failed; inspect the user units with systemctl --user status"
     die "the udev rule remains installed at ${rule_path}"
+  fi
+  if [[ ${restart_device_service} == true ]] && \
+    ! systemctl_user "${systemctl_cmd}" try-restart "${device_service}"; then
+    die "device gating is enabled, but ${device_service} could not be restarted"
   fi
 
   printf 'Device gating enabled for %s.\n' "${selected_device_id}"
