@@ -1,0 +1,478 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -euo pipefail
+
+readonly program='pam-u2f-touch-popup'
+readonly default_service='pam-u2f-touch-popup.service'
+readonly device_path_unit='pam-u2f-touch-popup-device.path'
+readonly device_service='pam-u2f-touch-popup-device.service'
+readonly testing=${PAM_U2F_TOUCH_POPUP_SETUP_TESTING:-0}
+
+if [[ ${testing} == 1 ]]; then
+  readonly sys_class_hidraw=${PAM_U2F_TOUCH_POPUP_SYS_CLASS_HIDRAW:?}
+  readonly rule_path=${PAM_U2F_TOUCH_POPUP_RULE_PATH:?}
+  readonly marker_path=${PAM_U2F_TOUCH_POPUP_MARKER_PATH:?}
+  [[ ${sys_class_hidraw} == /tmp/* ]] || exit 2
+  [[ ${rule_path} == /tmp/* ]] || exit 2
+  [[ ${marker_path} == /tmp/* ]] || exit 2
+else
+  readonly sys_class_hidraw='/sys/class/hidraw'
+  readonly rule_path='/etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules'
+  readonly marker_path='/dev/pam-u2f-touch-popup-key'
+fi
+
+declare -a device_ids=()
+declare -a device_labels=()
+selected_device_id=
+temp_dir=
+
+usage() {
+  cat <<'EOF'
+Usage:
+  pam-u2f-touch-popup-setup list
+  pam-u2f-touch-popup-setup enable [--yes] [VENDOR_ID:PRODUCT_ID]
+  pam-u2f-touch-popup-setup status
+  pam-u2f-touch-popup-setup disable [--yes]
+
+Commands:
+  list      List connected FIDO authenticator models.
+  enable    Select a model, install its udev rule, and enable device gating.
+  status    Show the gate rule, marker, and user-unit states.
+  disable   Remove device gating and restore the default service.
+
+Run this command as the desktop user, not with sudo. The enable and disable
+commands invoke sudo only for the system udev rule.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+cleanup() {
+  local rm_cmd
+
+  if [[ -n ${temp_dir} ]]; then
+    rm_cmd=$(find_command rm)
+    "${rm_cmd}" -rf -- "${temp_dir}"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+find_command() {
+  local name=$1
+  local path
+
+  if [[ ${testing} == 1 ]]; then
+    path=$(command -v -- "${name}") || die "required command not found: ${name}"
+    [[ ${path} == /* ]] || die "command does not resolve to an absolute path: ${name}"
+    printf '%s\n' "${path}"
+    return
+  fi
+
+  for path in \
+    "/usr/bin/${name}" \
+    "/usr/sbin/${name}" \
+    "/bin/${name}" \
+    "/sbin/${name}"; do
+    if [[ -f ${path} && -x ${path} ]]; then
+      printf '%s\n' "${path}"
+      return
+    fi
+  done
+  die "required command not found in a system directory: ${name}"
+}
+
+systemctl_user() {
+  local systemctl_cmd=$1
+  local SYSTEMD_PAGER=cat
+  shift
+  export SYSTEMD_PAGER
+  "${systemctl_cmd}" --user --no-pager "$@"
+}
+
+sanitize_label() {
+  local label=$1
+
+  label=${label//_/ }
+  label=${label//$'\t'/ }
+  label=${label//$'\r'/ }
+  printf '%s\n' "${label}"
+}
+
+discover_devices() {
+  local udevadm_cmd=$1
+  local sysdev properties property value
+  local fido vendor_id product_id vendor_name model_name id label
+  local existing known
+
+  device_ids=()
+  device_labels=()
+  shopt -s nullglob
+  for sysdev in "${sys_class_hidraw}"/hidraw*; do
+    if ! properties=$("${udevadm_cmd}" info --query=property --path="${sysdev}" 2>/dev/null); then
+      continue
+    fi
+
+    fido=
+    vendor_id=
+    product_id=
+    vendor_name=
+    model_name=
+    while IFS='=' read -r property value; do
+      case ${property} in
+        ID_FIDO_TOKEN) fido=${value} ;;
+        ID_VENDOR_ID) vendor_id=${value} ;;
+        ID_MODEL_ID) product_id=${value} ;;
+        ID_VENDOR) vendor_name=${value} ;;
+        ID_MODEL) model_name=${value} ;;
+      esac
+    done <<<"${properties}"
+
+    [[ ${fido} == 1 ]] || continue
+    [[ ${vendor_id} =~ ^[0-9A-Fa-f]{4}$ ]] || continue
+    [[ ${product_id} =~ ^[0-9A-Fa-f]{4}$ ]] || continue
+    id="${vendor_id,,}:${product_id,,}"
+
+    known=false
+    for existing in "${device_ids[@]}"; do
+      if [[ ${existing} == "${id}" ]]; then
+        known=true
+        break
+      fi
+    done
+    [[ ${known} == false ]] || continue
+
+    vendor_name=$(sanitize_label "${vendor_name:-Unknown vendor}")
+    model_name=$(sanitize_label "${model_name:-Unknown model}")
+    label="${vendor_name} ${model_name}"
+    device_ids+=("${id}")
+    device_labels+=("${label}")
+  done
+  shopt -u nullglob
+}
+
+print_devices() {
+  local index
+
+  if (( ${#device_ids[@]} == 0 )); then
+    printf '%s\n' 'No connected FIDO authenticators were found.'
+    return
+  fi
+
+  printf '%s\n' 'Connected FIDO authenticator models:'
+  for ((index = 0; index < ${#device_ids[@]}; index++)); do
+    printf '  %d. %s (%s)\n' \
+      "$((index + 1))" "${device_labels[index]}" "${device_ids[index]}"
+  done
+}
+
+normalize_device_id() {
+  local id=$1
+
+  [[ ${id} =~ ^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}$ ]] || \
+    die "device ID must have the form VENDOR_ID:PRODUCT_ID, for example 1050:0402"
+  printf '%s\n' "${id,,}"
+}
+
+choose_device() {
+  local udevadm_cmd=$1
+  local choice index
+
+  discover_devices "${udevadm_cmd}"
+  print_devices >&2
+  (( ${#device_ids[@]} > 0 )) || \
+    die 'connect the desired key or pass its VENDOR_ID:PRODUCT_ID explicitly'
+
+  if (( ${#device_ids[@]} == 1 )); then
+    selected_device_id=${device_ids[0]}
+    printf 'Using the only detected model: %s (%s)\n' \
+      "${device_labels[0]}" "${selected_device_id}" >&2
+    return
+  fi
+
+  [[ -t 0 ]] || \
+    die 'multiple models were found; pass VENDOR_ID:PRODUCT_ID explicitly'
+  read -r -p "Select a model [1-${#device_ids[@]}]: " choice
+  [[ ${choice} =~ ^[0-9]+$ ]] || die 'selection must be a number'
+  index=$((10#${choice} - 1))
+  (( index >= 0 && index < ${#device_ids[@]} )) || die 'selection is out of range'
+  selected_device_id=${device_ids[index]}
+}
+
+confirm_or_exit() {
+  local assume_yes=$1
+  local prompt=$2
+  local response
+
+  if [[ ${assume_yes} == true ]]; then
+    return
+  fi
+  [[ -t 0 ]] || die 'confirmation requires a terminal; rerun with --yes if appropriate'
+  read -r -p "${prompt} [y/N] " response
+  case ${response} in
+    y|Y|yes|YES|Yes) ;;
+    *)
+      printf '%s\n' 'Cancelled.'
+      exit 0
+      ;;
+  esac
+}
+
+rule_is_related() {
+  local line
+
+  [[ -r ${rule_path} ]] || return 1
+  while IFS= read -r line; do
+    [[ ${line} == *'SYMLINK+="pam-u2f-touch-popup-key"'* ]] && return 0
+  done <"${rule_path}"
+  return 1
+}
+
+create_rule() {
+  local device_id=$1
+  local mktemp_cmd=$2
+  local vendor_id=${device_id%:*}
+  local product_id=${device_id#*:}
+
+  temp_dir=$("${mktemp_cmd}" -d)
+  generated_rule="${temp_dir}/70-pam-u2f-touch-popup-device-gate.rules"
+  cat >"${generated_rule}" <<EOF
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Managed by ${program}-setup. Manual edits may be replaced.
+# Match every FIDO authenticator with USB ID ${device_id}.
+
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ENV{ID_FIDO_TOKEN}=="1", \\
+  ATTRS{idVendor}=="${vendor_id}", ATTRS{idProduct}=="${product_id}", TAG+="systemd", \\
+  SYMLINK+="pam-u2f-touch-popup-key", \\
+  ENV{SYSTEMD_ALIAS}+="/dev/pam-u2f-touch-popup-key"
+EOF
+}
+
+validate_rule() {
+  local udevadm_cmd=$1
+  local output
+
+  if "${udevadm_cmd}" verify --help >/dev/null 2>&1; then
+    if ! output=$("${udevadm_cmd}" verify "${generated_rule}" 2>&1); then
+      printf '%s\n' "${output}" >&2
+      die 'generated udev rule failed validation'
+    fi
+  fi
+}
+
+reload_hidraw_devices() {
+  local sudo_cmd=$1
+  local udevadm_cmd=$2
+
+  if ! "${sudo_cmd}" -- "${udevadm_cmd}" control --reload; then
+    die "the rule was changed, but udev could not reload it"
+  fi
+  if ! "${sudo_cmd}" -- "${udevadm_cmd}" trigger \
+    --action=change --subsystem-match=hidraw; then
+    warn 'udev was reloaded, but existing hidraw devices could not be retriggered; reconnect the selected key'
+    return
+  fi
+  if ! "${sudo_cmd}" -- "${udevadm_cmd}" settle; then
+    warn 'udev did not settle cleanly; reconnect the selected key if the gate marker is absent'
+  fi
+}
+
+unit_state() {
+  local systemctl_cmd=$1
+  local action=$2
+  local unit=$3
+  local state
+
+  state=$(systemctl_user "${systemctl_cmd}" "${action}" "${unit}" 2>/dev/null || :)
+  printf '%s\n' "${state:-unknown}"
+}
+
+command_list() {
+  local udevadm_cmd
+
+  udevadm_cmd=$(find_command udevadm)
+  discover_devices "${udevadm_cmd}"
+  print_devices
+}
+
+command_status() {
+  local systemctl_cmd
+
+  systemctl_cmd=$(find_command systemctl)
+  if [[ -e ${rule_path} ]]; then
+    printf 'Udev rule:       installed (%s)\n' "${rule_path}"
+  else
+    printf 'Udev rule:       not installed\n'
+  fi
+  if [[ -e ${marker_path} ]]; then
+    printf 'Selected key:    present (%s)\n' "${marker_path}"
+  else
+    printf 'Selected key:    absent\n'
+  fi
+  printf 'Default service: %s, %s\n' \
+    "$(unit_state "${systemctl_cmd}" is-enabled "${default_service}")" \
+    "$(unit_state "${systemctl_cmd}" is-active "${default_service}")"
+  printf 'Device path:     %s, %s\n' \
+    "$(unit_state "${systemctl_cmd}" is-enabled "${device_path_unit}")" \
+    "$(unit_state "${systemctl_cmd}" is-active "${device_path_unit}")"
+  printf 'Device service:  %s, %s\n' \
+    "$(unit_state "${systemctl_cmd}" is-enabled "${device_service}")" \
+    "$(unit_state "${systemctl_cmd}" is-active "${device_service}")"
+}
+
+command_enable() {
+  local assume_yes=false
+  local requested_id=
+  local arg systemctl_cmd udevadm_cmd sudo_cmd install_cmd mktemp_cmd
+  local restart_device_service=false
+
+  selected_device_id=
+
+  for arg in "$@"; do
+    case ${arg} in
+      --yes) assume_yes=true ;;
+      -*) die "unknown enable option: ${arg}" ;;
+      *)
+        [[ -z ${requested_id} ]] || die 'enable accepts at most one device ID'
+        requested_id=${arg}
+        ;;
+    esac
+  done
+
+  systemctl_cmd=$(find_command systemctl)
+  udevadm_cmd=$(find_command udevadm)
+  sudo_cmd=$(find_command sudo)
+  install_cmd=$(find_command install)
+  mktemp_cmd=$(find_command mktemp)
+  systemctl_user "${systemctl_cmd}" daemon-reload
+  systemctl_user "${systemctl_cmd}" cat "${device_path_unit}" >/dev/null 2>&1 || \
+    die "${device_path_unit} is not installed"
+  systemctl_user "${systemctl_cmd}" cat "${device_service}" >/dev/null 2>&1 || \
+    die "${device_service} is not installed"
+  if systemctl_user "${systemctl_cmd}" is-active --quiet "${device_service}"; then
+    restart_device_service=true
+  fi
+
+  if [[ -n ${requested_id} ]]; then
+    selected_device_id=$(normalize_device_id "${requested_id}")
+  else
+    choose_device "${udevadm_cmd}"
+    selected_device_id=${selected_device_id:-${device_ids[0]}}
+  fi
+
+  if [[ -e ${rule_path} ]] && ! rule_is_related; then
+    die "${rule_path} exists but is not a ${program} device-gate rule"
+  fi
+  confirm_or_exit "${assume_yes}" \
+    "Enable the popup for every FIDO authenticator matching ${selected_device_id}?"
+
+  create_rule "${selected_device_id}" "${mktemp_cmd}"
+  validate_rule "${udevadm_cmd}"
+  "${sudo_cmd}" -v
+  "${sudo_cmd}" -- "${install_cmd}" -Dm0644 "${generated_rule}" "${rule_path}"
+  reload_hidraw_devices "${sudo_cmd}" "${udevadm_cmd}"
+
+  if ! systemctl_user "${systemctl_cmd}" disable --now "${default_service}"; then
+    die "the udev rule remains installed, but ${default_service} could not be disabled"
+  fi
+  if ! systemctl_user "${systemctl_cmd}" enable --now "${device_path_unit}"; then
+    warn "enabling ${device_path_unit} failed; restoring ${default_service}"
+    systemctl_user "${systemctl_cmd}" enable --now "${default_service}" || \
+      warn "automatic rollback also failed; inspect the user units with systemctl --user status"
+    die "the udev rule remains installed at ${rule_path}"
+  fi
+  if [[ ${restart_device_service} == true ]] && \
+    ! systemctl_user "${systemctl_cmd}" try-restart "${device_service}"; then
+    die "device gating is enabled, but ${device_service} could not be restarted"
+  fi
+
+  printf 'Device gating enabled for %s.\n' "${selected_device_id}"
+  command_status
+}
+
+command_disable() {
+  local assume_yes=false
+  local arg systemctl_cmd udevadm_cmd sudo_cmd rm_cmd
+
+  for arg in "$@"; do
+    case ${arg} in
+      --yes) assume_yes=true ;;
+      *) die "unknown disable option: ${arg}" ;;
+    esac
+  done
+
+  if [[ -e ${rule_path} ]] && ! rule_is_related; then
+    die "${rule_path} exists but is not a ${program} device-gate rule"
+  fi
+  confirm_or_exit "${assume_yes}" \
+    'Disable device gating and restore the always-running popup service?'
+
+  systemctl_cmd=$(find_command systemctl)
+  systemctl_user "${systemctl_cmd}" daemon-reload
+  systemctl_user "${systemctl_cmd}" disable --now "${device_path_unit}"
+  if ! systemctl_user "${systemctl_cmd}" enable --now "${default_service}"; then
+    warn "restoring ${default_service} failed; re-enabling ${device_path_unit}"
+    systemctl_user "${systemctl_cmd}" enable --now "${device_path_unit}" || true
+    die 'device gating was left enabled'
+  fi
+
+  if [[ -e ${rule_path} ]]; then
+    udevadm_cmd=$(find_command udevadm)
+    sudo_cmd=$(find_command sudo)
+    rm_cmd=$(find_command rm)
+    "${sudo_cmd}" -v
+    "${sudo_cmd}" -- "${rm_cmd}" -f -- "${rule_path}"
+    reload_hidraw_devices "${sudo_cmd}" "${udevadm_cmd}"
+  fi
+
+  printf '%s\n' 'Device gating disabled; the default popup service is enabled.'
+  command_status
+}
+
+main() {
+  local command=${1:-}
+
+  case ${command} in
+    -h|--help|help)
+      usage
+      return
+      ;;
+  esac
+
+  (( EUID != 0 )) || \
+    die 'run this command as the desktop user, not with sudo'
+  [[ -n ${command} ]] || {
+    usage >&2
+    exit 2
+  }
+  shift
+
+  case ${command} in
+    list)
+      (( $# == 0 )) || die 'list does not accept arguments'
+      command_list
+      ;;
+    enable) command_enable "$@" ;;
+    status)
+      (( $# == 0 )) || die 'status does not accept arguments'
+      command_status
+      ;;
+    disable) command_disable "$@" ;;
+    *)
+      usage >&2
+      die "unknown command: ${command}"
+      ;;
+  esac
+}
+
+main "$@"

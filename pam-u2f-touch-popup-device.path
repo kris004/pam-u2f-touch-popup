@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Unit]
+Description=Start pam-u2f touch popup while the selected security key is present
+PartOf=graphical-session.target
+
+[Path]
+PathExists=/dev/pam-u2f-touch-popup-key
+Unit=pam-u2f-touch-popup-device.service
+
+[Install]
+WantedBy=graphical-session.target
