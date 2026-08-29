@@ -333,6 +333,39 @@ def test_status_reports_marker_and_units() -> None:
         assert "Device service:  static, inactive" in result.stdout
 
 
+def test_production_ignores_path_override() -> None:
+    with tempfile.TemporaryDirectory() as tmp_string:
+        tmp = Path(tmp_string)
+        marker = tmp / "fake-systemctl-ran"
+        fake_systemctl = tmp / "systemctl"
+        fake_systemctl.write_text(
+            "#!/bin/sh\n"
+            f"touch {marker}\n"
+            "exit 1\n"
+        )
+        fake_systemctl.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{tmp}:/usr/bin:/bin"
+        for name in (
+            "PAM_U2F_TOUCH_POPUP_SETUP_TESTING",
+            "PAM_U2F_TOUCH_POPUP_SYS_CLASS_HIDRAW",
+            "PAM_U2F_TOUCH_POPUP_RULE_PATH",
+            "PAM_U2F_TOUCH_POPUP_MARKER_PATH",
+        ):
+            env.pop(name, None)
+
+        result = subprocess.run(
+            [str(SETUP), "status"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not marker.exists()
+
+
 def test_make_install_device_delegates_to_setup() -> None:
     with tempfile.TemporaryDirectory() as tmp_string:
         tmp = Path(tmp_string)
@@ -428,6 +461,7 @@ def main() -> int:
         test_enable_refuses_unrelated_rule,
         test_disable_restores_default_and_removes_rule,
         test_status_reports_marker_and_units,
+        test_production_ignores_path_override,
         test_make_install_device_delegates_to_setup,
         test_make_install_device_rejects_staging,
         test_make_install_ignores_environment_device,

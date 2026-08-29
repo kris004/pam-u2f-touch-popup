@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 set -euo pipefail
@@ -7,8 +7,9 @@ readonly program='pam-u2f-touch-popup'
 readonly default_service='pam-u2f-touch-popup.service'
 readonly device_path_unit='pam-u2f-touch-popup-device.path'
 readonly device_service='pam-u2f-touch-popup-device.service'
+readonly testing=${PAM_U2F_TOUCH_POPUP_SETUP_TESTING:-0}
 
-if [[ ${PAM_U2F_TOUCH_POPUP_SETUP_TESTING:-0} == 1 ]]; then
+if [[ ${testing} == 1 ]]; then
   readonly sys_class_hidraw=${PAM_U2F_TOUCH_POPUP_SYS_CLASS_HIDRAW:?}
   readonly rule_path=${PAM_U2F_TOUCH_POPUP_RULE_PATH:?}
   readonly marker_path=${PAM_U2F_TOUCH_POPUP_MARKER_PATH:?}
@@ -55,8 +56,11 @@ warn() {
 }
 
 cleanup() {
+  local rm_cmd
+
   if [[ -n ${temp_dir} ]]; then
-    rm -rf -- "${temp_dir}"
+    rm_cmd=$(find_command rm)
+    "${rm_cmd}" -rf -- "${temp_dir}"
   fi
 }
 trap cleanup EXIT
@@ -68,9 +72,24 @@ find_command() {
   local name=$1
   local path
 
-  path=$(command -v -- "${name}") || die "required command not found: ${name}"
-  [[ ${path} == /* ]] || die "command does not resolve to an absolute path: ${name}"
-  printf '%s\n' "${path}"
+  if [[ ${testing} == 1 ]]; then
+    path=$(command -v -- "${name}") || die "required command not found: ${name}"
+    [[ ${path} == /* ]] || die "command does not resolve to an absolute path: ${name}"
+    printf '%s\n' "${path}"
+    return
+  fi
+
+  for path in \
+    "/usr/bin/${name}" \
+    "/usr/sbin/${name}" \
+    "/bin/${name}" \
+    "/sbin/${name}"; do
+    if [[ -f ${path} && -x ${path} ]]; then
+      printf '%s\n' "${path}"
+      return
+    fi
+  done
+  die "required command not found in a system directory: ${name}"
 }
 
 systemctl_user() {
@@ -210,16 +229,22 @@ confirm_or_exit() {
 }
 
 rule_is_related() {
-  [[ -r ${rule_path} ]] && \
-    grep -Fq 'SYMLINK+="pam-u2f-touch-popup-key"' "${rule_path}"
+  local line
+
+  [[ -r ${rule_path} ]] || return 1
+  while IFS= read -r line; do
+    [[ ${line} == *'SYMLINK+="pam-u2f-touch-popup-key"'* ]] && return 0
+  done <"${rule_path}"
+  return 1
 }
 
 create_rule() {
   local device_id=$1
+  local mktemp_cmd=$2
   local vendor_id=${device_id%:*}
   local product_id=${device_id#*:}
 
-  temp_dir=$(mktemp -d)
+  temp_dir=$("${mktemp_cmd}" -d)
   generated_rule="${temp_dir}/70-pam-u2f-touch-popup-device-gate.rules"
   cat >"${generated_rule}" <<EOF
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -308,7 +333,7 @@ command_status() {
 command_enable() {
   local assume_yes=false
   local requested_id=
-  local arg systemctl_cmd udevadm_cmd sudo_cmd install_cmd
+  local arg systemctl_cmd udevadm_cmd sudo_cmd install_cmd mktemp_cmd
   local restart_device_service=false
 
   selected_device_id=
@@ -328,6 +353,7 @@ command_enable() {
   udevadm_cmd=$(find_command udevadm)
   sudo_cmd=$(find_command sudo)
   install_cmd=$(find_command install)
+  mktemp_cmd=$(find_command mktemp)
   systemctl_user "${systemctl_cmd}" daemon-reload
   systemctl_user "${systemctl_cmd}" cat "${device_path_unit}" >/dev/null 2>&1 || \
     die "${device_path_unit} is not installed"
@@ -350,7 +376,7 @@ command_enable() {
   confirm_or_exit "${assume_yes}" \
     "Enable the popup for every FIDO authenticator matching ${selected_device_id}?"
 
-  create_rule "${selected_device_id}"
+  create_rule "${selected_device_id}" "${mktemp_cmd}"
   validate_rule "${udevadm_cmd}"
   "${sudo_cmd}" -v
   "${sudo_cmd}" -- "${install_cmd}" -Dm0644 "${generated_rule}" "${rule_path}"
