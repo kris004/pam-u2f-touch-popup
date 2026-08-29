@@ -449,8 +449,9 @@ main() {
       ;;
   esac
 
-  (( EUID != 0 )) || \
+  if [[ ${testing} != 1 ]] && (( EUID == 0 )); then
     die 'run this command as the desktop user, not with sudo'
+  fi
   [[ -n ${command} ]] || {
     usage >&2
     exit 2
