@@ -66,6 +66,7 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 
 readonly package_dir="${tmp_dir}/${archive_root}"
 install -Dm755 "${binary}" "${package_dir}/bin/${program}"
+install -Dm755 "${program}-setup" "${package_dir}/bin/${program}-setup"
 install -Dm644 README.md "${package_dir}/share/doc/${program}/README.md"
 install -Dm644 LICENSE "${package_dir}/share/doc/${program}/LICENSE"
 install -Dm644 examples/70-pam-u2f-touch-popup-device-gate.rules \

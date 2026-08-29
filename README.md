@@ -28,6 +28,8 @@ no-device probes do not flash a dialog.
 - `pam_u2f` configured for the graphical-session user
 - Zenity installed at `/usr/bin/zenity`, or another absolute path selected at
   build time
+- Bash for `pam-u2f-touch-popup-setup`
+- systemd, udev, and sudo when using the optional device-presence gate
 
 No library beyond libc is linked into the helper.
 
@@ -46,8 +48,8 @@ opens graphical dialogs nor invokes PAM.
 Each GitHub release provides:
 
 - `pam-u2f-touch-popup-VERSION-linux-x86_64-musl.tar.gz`, containing a static
-  position-independent x86-64 Linux binary, the default and optional
-  device-gated user units, and an example udev rule laid out for
+  position-independent x86-64 Linux binary, the setup command, the default and
+  optional device-gated user units, and an example udev rule laid out for
   `$HOME/.local`;
 - `pam-u2f-touch-popup-VERSION-src.tar.gz`, containing the exact tagged source;
   and
@@ -83,6 +85,14 @@ systemctl --user daemon-reload
 systemctl --user enable --now pam-u2f-touch-popup.service
 ```
 
+For the optional device gate, extract the archive in the same way but run the
+included setup command instead of enabling the default service:
+
+```sh
+"$HOME/.local/bin/pam-u2f-touch-popup-setup" list
+"$HOME/.local/bin/pam-u2f-touch-popup-setup" enable
+```
+
 Users of other architectures can build from the source archive with the
 commands below.
 
@@ -97,9 +107,23 @@ systemctl --user daemon-reload
 systemctl --user enable --now pam-u2f-touch-popup.service
 ```
 
+For a source installation with device gating, list the connected FIDO models
+and pass the selected USB ID during installation:
+
+```sh
+make list-devices
+make install DEVICE=1050:0402
+```
+
+`DEVICE` is optional. When it is absent, `make install` never invokes sudo or
+changes live user services. When present, it installs the udev rule and enables
+the gated path after installing the user-local files. It cannot be combined
+with `DESTDIR`, so staged distribution builds remain side-effect free.
+
 The defaults are:
 
 - executable: `$HOME/.local/bin/pam-u2f-touch-popup`
+- setup command: `$HOME/.local/bin/pam-u2f-touch-popup-setup`
 - user units: `$HOME/.local/share/systemd/user/pam-u2f-touch-popup*.service`
   and `$HOME/.local/share/systemd/user/pam-u2f-touch-popup-device.path`
 - optional udev example:
@@ -115,15 +139,16 @@ make \
   DESTDIR=/tmp/package-root \
   PREFIX=/usr \
   BINDIR=/usr/libexec \
+  SETUPDIR=/usr/bin \
   UNITDIR=/usr/lib/systemd/user \
   DOCDIR=/usr/share/doc/pam-u2f-touch-popup \
   install
 ```
 
-`BINDIR` is embedded in each service's `ExecStart=` setting. `UNITDIR` and
-`DOCDIR` only control where files are installed. Distribution packages should
-use their package-manager helpers to select the native libexec, systemd
-user-unit, and documentation directories.
+`BINDIR` is embedded in each service's `ExecStart=` setting. `SETUPDIR`,
+`UNITDIR`, and `DOCDIR` only control where files are installed. Distribution
+packages should use their package-manager helpers to select the native command,
+libexec, systemd user-unit, and documentation directories.
 
 The service is tied to `graphical-session.target`. Desktop environments usually
 import `DISPLAY` or `WAYLAND_DISPLAY` into the systemd user manager. Minimal
@@ -151,16 +176,52 @@ the alternate service when that path appears, and the service's device binding
 stops it when the device is unplugged. Device selection therefore does not
 depend on the popup delay.
 
-The installed example selects the Yubico USB ID `1050:0402`. To select a
-different model, find the FIDO hidraw node and inspect its parent attributes:
+Run the setup command as the desktop user, not with sudo. It discovers
+connected FIDO models, asks for confirmation, invokes sudo only to install the
+udev rule, reloads existing hidraw devices, and switches the user services. If
+only one model is connected, `enable` selects it automatically; otherwise it
+presents a numbered choice:
 
 ```sh
-udevadm info --query=property --name=/dev/hidrawN
-udevadm info --attribute-walk --name=/dev/hidrawN
+pam-u2f-touch-popup-setup list
+pam-u2f-touch-popup-setup enable
 ```
 
-Copy the example into the system udev configuration, edit `idVendor` and
-`idProduct` if necessary, reload udev, and reconnect the selected key:
+An explicit USB ID also works when the key is not currently connected:
+
+```sh
+pam-u2f-touch-popup-setup enable 1050:0402
+```
+
+Source users can perform the install and explicit selection together:
+
+```sh
+make install DEVICE=1050:0402
+```
+
+Inspect the resulting state or return to the default service with:
+
+```sh
+pam-u2f-touch-popup-setup status
+pam-u2f-touch-popup-setup disable
+```
+
+From a source checkout, `make device-gate-status` and
+`make disable-device-gate` provide the same operations.
+
+The setup command validates the generated rule before installation when the
+local udev version supports `udevadm verify`. If enabling the path unit fails,
+it restores the default service and leaves the rule in place for inspection.
+
+Selection is model-wide: every FIDO key with the chosen USB vendor and product
+ID will match. Selecting one physical unit additionally requires a stable
+serial attribute and a corresponding `ATTRS{serial}==` match; not all
+authenticators expose a USB serial number.
+
+For manual configuration, the installed example selects the Yubico USB ID
+`1050:0402`. Copy it into the system udev configuration, edit `idVendor` and
+`idProduct` if necessary, reload udev, reconnect the selected key, and switch
+the user services:
 
 ```sh
 sudo install -Dm644 \
@@ -168,38 +229,8 @@ sudo install -Dm644 \
   /etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules
 sudoedit /etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules
 sudo udevadm control --reload
-```
-
-Then replace the default service with the gated path unit. Do not enable both
-services, because two helpers would watch the same authpending file.
-
-```sh
-systemctl --user daemon-reload
 systemctl --user disable --now pam-u2f-touch-popup.service
 systemctl --user enable --now pam-u2f-touch-popup-device.path
-```
-
-The path unit remains active. The device service should be inactive without a
-matching key, active after that key is connected, and inactive again after it
-is unplugged:
-
-```sh
-systemctl --user status pam-u2f-touch-popup-device.path
-systemctl --user status pam-u2f-touch-popup-device.service
-```
-
-The example matches a model by USB vendor and product ID. Every key with those
-IDs will match. Selecting one physical unit additionally requires a stable
-serial attribute and a corresponding `ATTRS{serial}==` match; not all
-authenticators expose a USB serial number.
-
-To return to the default behavior:
-
-```sh
-systemctl --user disable --now pam-u2f-touch-popup-device.path
-systemctl --user enable --now pam-u2f-touch-popup.service
-sudo rm /etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules
-sudo udevadm control --reload
 ```
 
 ## Configuration
@@ -285,12 +316,12 @@ reset the popup state rather than leaving a stale dialog behind.
 
 ## Uninstall
 
-If the optional device gate is enabled, disable its path unit and remove the
-udev rule copied into `/etc/udev/rules.d` first. `make uninstall` only removes
+If the optional device gate is enabled, disable it first so the default service
+is restored and the system udev rule is removed. `make uninstall` only removes
 files installed below its configured prefix.
 
 ```sh
-systemctl --user disable --now pam-u2f-touch-popup-device.path
+pam-u2f-touch-popup-setup disable
 systemctl --user disable --now pam-u2f-touch-popup.service
 make uninstall
 systemctl --user daemon-reload
