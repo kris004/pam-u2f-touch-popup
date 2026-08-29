@@ -165,38 +165,22 @@ autostart mechanism.
 
 ### Optional device-presence gate
 
-Nothing in this section is required on a system where every connected FIDO
-authenticator should use the popup. The default
-`pam-u2f-touch-popup.service` remains the normal setup.
+The default service is appropriate when every connected FIDO authenticator
+should use the popup. On systems that keep other authenticator models connected,
+the optional gate keeps the helper stopped unless a selected model is present.
+It exposes matching devices as `/dev/pam-u2f-touch-popup-key`; a path unit starts
+the alternate service when that path appears, and a device binding stops it on
+unplug. Selection therefore does not depend on the popup delay.
 
-On a system with multiple authenticator models, the optional gate keeps the
-helper stopped unless a selected model is present. An example udev rule exposes
-the selected FIDO device as `/dev/pam-u2f-touch-popup-key`; a path unit starts
-the alternate service when that path appears, and the service's device binding
-stops it when the device is unplugged. Device selection therefore does not
-depend on the popup delay.
-
-Run the setup command as the desktop user, not with sudo. It discovers
-connected FIDO models, asks for confirmation, invokes sudo only to install the
-udev rule, reloads existing hidraw devices, and switches the user services. If
-only one model is connected, `enable` selects it automatically; otherwise it
-presents a numbered choice:
-
-```sh
-pam-u2f-touch-popup-setup list
-pam-u2f-touch-popup-setup enable
-```
+Use either installation workflow above to enable the gate. Run the setup command
+as the desktop user, not with sudo; it invokes sudo only to install the udev
+rule. A single connected FIDO model is selected automatically, while multiple
+models produce a numbered choice.
 
 An explicit USB ID also works when the key is not currently connected:
 
 ```sh
 pam-u2f-touch-popup-setup enable 1050:0402
-```
-
-Source users can perform the install and explicit selection together:
-
-```sh
-make install DEVICE=1050:0402
 ```
 
 Inspect the resulting state or return to the default service with:
@@ -208,10 +192,6 @@ pam-u2f-touch-popup-setup disable
 
 From a source checkout, `make device-gate-status` and
 `make disable-device-gate` provide the same operations.
-
-The setup command validates the generated rule before installation when the
-local udev version supports `udevadm verify`. If enabling the path unit fails,
-it restores the default service and leaves the rule in place for inspection.
 
 Selection is model-wide: every FIDO key with the chosen USB vendor and product
 ID will match. Selecting one physical unit additionally requires a stable
@@ -249,11 +229,12 @@ If a PAM service sets `authpending_file` explicitly, configure the helper with
 the same path. The file's parent must be a real directory owned by the helper's
 effective user ID, with no group or other permission bits. The default
 `/run/user/$UID` directory normally meets these requirements. For the systemd
-unit, use a drop-in. When the optional gate is enabled, edit
-`pam-u2f-touch-popup-device.service` instead:
+unit, use a drop-in:
 
 ```sh
 systemctl --user edit pam-u2f-touch-popup.service
+# With the optional device gate:
+systemctl --user edit pam-u2f-touch-popup-device.service
 ```
 
 For example:
