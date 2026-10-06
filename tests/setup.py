@@ -22,6 +22,7 @@ class Harness:
         self.root = root
         self.bin = root / "bin"
         self.sys_class_hidraw = root / "sys" / "class" / "hidraw"
+        self.sys_devices = root / "sys" / "devices"
         self.properties = root / "properties"
         self.rule = root / "etc" / "udev" / "rules.d" / "gate.rules"
         self.marker = root / "dev" / "pam-u2f-touch-popup-key"
@@ -29,6 +30,7 @@ class Harness:
         self.setup = root / "setup-fixture"
         self.bin.mkdir(parents=True)
         self.sys_class_hidraw.mkdir(parents=True)
+        self.sys_devices.mkdir()
         self.properties.mkdir()
         self._write_fake_commands()
         self._write_test_artifact()
@@ -50,6 +52,9 @@ class Harness:
         replacements = {
             "readonly sys_class_hidraw='/sys/class/hidraw'": (
                 f"readonly sys_class_hidraw={shlex.quote(str(self.sys_class_hidraw))}", 1
+            ),
+            "readonly sys_devices='/sys/devices'": (
+                f"readonly sys_devices={shlex.quote(str(self.sys_devices))}", 1
             ),
             "readonly rule_path='/etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules'": (
                 f"readonly rule_path={shlex.quote(str(self.rule))}", 2
@@ -189,6 +194,29 @@ exec "$@"
             check=False,
         )
 
+    def add_usb_parent(self, name: str, vendor_id: str, product_id: str) -> Path:
+        hub = self.sys_devices / "usb1"
+        hub.mkdir(exist_ok=True)
+        (hub / "uevent").write_text("DEVTYPE=usb_device\n")
+        (hub / "idVendor").write_text("1d6b\n")
+        (hub / "idProduct").write_text("0002\n")
+        parent = hub / name
+        interface = parent / "interface"
+        hid = interface / "hid"
+        hidraw = hid / "hidraw" / name
+        hidraw.mkdir(parents=True)
+        (self.sys_class_hidraw / name).symlink_to(hidraw)
+        (hidraw / "device").symlink_to(hid)
+        (hid / "uevent").write_text("HID_ID=0003:00001050:00000402\n")
+        (interface / "uevent").write_text("DEVTYPE=usb_interface\n")
+        (parent / "uevent").write_text("DEVTYPE=usb_device\n")
+        (parent / "idVendor").write_text(vendor_id + "\n")
+        (parent / "idProduct").write_text(product_id + "\n")
+        (parent / "manufacturer").write_text("USB fixture\n")
+        (parent / "product").write_text("FIDO fixture\n")
+        (self.properties / name).write_text("ID_FIDO_TOKEN=1\n")
+        return parent
+
     def commands(self) -> list[str]:
         if not self.log.exists():
             return []
@@ -226,6 +254,85 @@ def test_list_deduplicates_fido_models() -> None:
         assert result.stdout.count("(1050:0407)") == 1
         assert "YubiKey FIDO" in result.stdout
         assert "Keyboard" not in result.stdout
+
+
+def test_list_and_autoselect_without_udev_usb_properties() -> None:
+    temporary_directory, harness = new_harness()
+    with temporary_directory:
+        harness.add_usb_parent("hidraw0", "1050", "0402")
+        harness.add_usb_parent("hidraw1", "1050", "0402")
+
+        result = harness.run("list")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.count("(1050:0402)") == 1
+        assert "USB fixture FIDO fixture" in result.stdout
+
+        result = harness.run("enable", "--yes")
+        assert result.returncode == 0, result.stderr
+        assert "Using the only detected model:" in result.stderr
+        rule = harness.rule.read_text()
+        assert 'ATTRS{idVendor}=="1050"' in rule
+        assert 'ATTRS{idProduct}=="0402"' in rule
+
+
+def test_usb_fallback_rejects_non_fido_and_invalid_parents() -> None:
+    temporary_directory, harness = new_harness()
+    with temporary_directory:
+        harness.add_usb_parent("hidraw0", "1050", "0402")
+        (harness.properties / "hidraw0").write_text("ID_FIDO_TOKEN=0\n")
+        harness.add_usb_parent("hidraw1", '1050; RUN+="payload"', "0402")
+        parent = harness.add_usb_parent("hidraw2", "1050", "0402")
+        (parent / "idProduct").unlink()
+        # A complete readable hub must never supply the absent key identity.
+        assert (parent.parent / "idVendor").read_text().strip() == "1d6b"
+        assert (parent.parent / "idProduct").read_text().strip() == "0002"
+        outside = harness.root / "outside-sysfs"
+        outside.mkdir()
+        (outside / "idVendor").write_text("1050\n")
+        (outside / "idProduct").write_text("0402\n")
+        (outside / "uevent").write_text("DEVTYPE=usb_device\n")
+        (outside / "device").symlink_to(outside)
+        (harness.sys_class_hidraw / "hidraw3").symlink_to(outside)
+        (harness.properties / "hidraw3").write_text("ID_FIDO_TOKEN=1\n")
+        parent = harness.add_usb_parent("hidraw4", "1050", "0402")
+        (parent / "uevent").unlink()
+        parent = harness.add_usb_parent("hidraw5", "1050", "0402")
+        (parent / "idVendor").unlink()
+        (parent / "idProduct").unlink()
+
+        result = harness.run("list")
+        assert result.returncode == 0, result.stderr
+        assert "No connected FIDO authenticators" in result.stdout
+        assert not any(line.startswith("sudo ") for line in harness.commands())
+
+
+def test_usb_descriptor_labels_cannot_emit_terminal_controls() -> None:
+    temporary_directory, harness = new_harness()
+    with temporary_directory:
+        parent = harness.add_usb_parent("hidraw0", "1050", "0402")
+        (parent / "manufacturer").write_text("USB\x1b[2J_fixture\x7f\n")
+        (parent / "product").write_text("FIDO\x01fixture\tkey\n")
+
+        result = harness.run("list")
+        assert result.returncode == 0, result.stderr
+        assert "(1050:0402)" in result.stdout
+        assert all(ord(char) >= 32 or char == "\n" for char in result.stdout)
+        assert "\x7f" not in result.stdout
+
+
+def test_valid_udev_usb_identity_takes_precedence() -> None:
+    temporary_directory, harness = new_harness()
+    with temporary_directory:
+        harness.add_usb_parent("hidraw0", "1234", "abcd")
+        (harness.properties / "hidraw0").write_text(
+            "ID_FIDO_TOKEN=1\nID_VENDOR_ID=1050\nID_MODEL_ID=0402\n"
+            "ID_VENDOR=Udev_fixture\nID_MODEL=Known_model\n"
+        )
+
+        result = harness.run("list")
+        assert result.returncode == 0, result.stderr
+        assert "Udev fixture Known model (1050:0402)" in result.stdout
+        assert "1234:abcd" not in result.stdout
 
 
 def test_enable_generates_rule_and_switches_units() -> None:
@@ -715,6 +822,10 @@ def test_make_install_ignores_environment_device() -> None:
 def main() -> int:
     tests = [
         test_list_deduplicates_fido_models,
+        test_list_and_autoselect_without_udev_usb_properties,
+        test_usb_fallback_rejects_non_fido_and_invalid_parents,
+        test_usb_descriptor_labels_cannot_emit_terminal_controls,
+        test_valid_udev_usb_identity_takes_precedence,
         test_enable_generates_rule_and_switches_units,
         test_enable_autoselects_only_connected_model,
         test_enable_rejects_invalid_device_id,

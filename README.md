@@ -181,7 +181,8 @@ It accepts only the operation and a normalized USB ID, reconstructs the rule in
 private root-owned staging, validates it when `udevadm verify` is available, and
 atomically replaces the managed rule. It never installs a user-owned rule file.
 A single connected FIDO model is selected automatically, while multiple
-models produce a numbered choice.
+models produce a numbered choice. Detection requires udev's FIDO flag and reads
+USB identity from the kernel device parent when hidraw properties omit it.
 
 An explicit USB ID also works when the key is not currently connected:
 
