@@ -23,6 +23,8 @@ jobs:
       contents: read
     outputs:
       release-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      release-commit: ${{ steps.identity.outputs.commit }}
+      release-tag-object: ${{ steps.identity.outputs.tag-object }}
     env:
       CC: musl-gcc
       CFLAGS: >-
@@ -30,46 +32,56 @@ jobs:
         -fPIE -fstack-protector-strong
       LDFLAGS: -static-pie -s -Wl,-z,relro,-z,now
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Validate release tag
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-
-      - name: Verify signed release tag
-        if: github.ref_type == 'tag'
+      # Validate before checking out or executing any repository code.
+      - name: Resolve build identity
+        id: identity
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          ref_api="repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}"
-          if [[ $(gh api "$ref_api" --jq '.object.type') != tag ]]; then
-            echo 'release tag must be an annotated tag object' >&2
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF_TYPE" != tag ]]; then
+            printf 'commit=%s\n' "$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ ( "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ) &&
+             "$GITHUB_REF_TYPE" == tag ]]
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          # Read the mutable ref once, then query only the immutable tag object.
+          ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
+          tag_sha=$(jq -er '
+            select(.object.type == "tag") | .object.sha |
+            select(test("^[0-9a-f]{40}$"))' <<<"$ref")
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}")
+          commit=$(jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' <<<"$tag")
+          # Accept the event's peeled commit or its exact annotated tag object,
+          # but always build the verified direct commit target.
+          if [[ "$GITHUB_SHA" != "$commit" && "$GITHUB_SHA" != "$tag_sha" ]]; then
+            echo 'release tag identity does not match the workflow event' >&2
             exit 1
           fi
+          if ! jq -e --arg name "$GITHUB_REF_NAME" --arg object "$tag_sha" \
+            --arg commit "$commit" '
+              .sha == $object and .tag == $name and
+              .object.type == "commit" and .object.sha == $commit and
+              .verification.verified == true and .verification.reason == "valid"
+            ' <<<"$tag" >/dev/null; then
+            echo 'release tag must have a valid signature and directly target the event commit' >&2
+            exit 1
+          fi
+          printf 'commit=%s\ntag-object=%s\n' "$commit" "$tag_sha" >>"$GITHUB_OUTPUT"
 
-          tag_sha=$(gh api "$ref_api" --jq '.object.sha')
-          tag_api="repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}"
-          tag_name=$(gh api "$tag_api" --jq '.tag')
-          tag_target=$(gh api "$tag_api" --jq '.object.type')
-          if [[ "$tag_name" != "$GITHUB_REF_NAME" ||
-                "$tag_target" != commit ]]; then
-            echo 'release tag must point directly to a commit' >&2
-            exit 1
-          fi
-          verified=$(gh api "$tag_api" --jq '.verification.verified')
-          if [[ "$verified" != true ]]; then
-            reason=$(gh api "$tag_api" --jq '.verification.reason')
-            echo "release tag signature is not verified: ${reason}" >&2
-            exit 1
-          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.identity.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checkout identity
+        env:
+          VERIFIED_COMMIT: ${{ steps.identity.outputs.commit }}
+        run: test "$(git rev-parse HEAD)" = "$VERIFIED_COMMIT"
 
       - name: Install musl toolchain
         run: |
@@ -88,11 +100,14 @@ jobs:
           ./scripts/check-static-pie.sh pam-u2f-touch-popup
 
       - name: Package release assets
+        env:
+          RELEASE_REF: ${{ steps.identity.outputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
           release_tag=v0.0.0
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+          test "$(git rev-parse HEAD)" = "$RELEASE_REF"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
             release_tag=$GITHUB_REF_NAME
           fi
           make VERSION="$release_tag" RELEASE_TARGET=linux-x86_64-musl dist
@@ -115,7 +130,7 @@ jobs:
 
   attest:
     name: Attest release assets
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -135,6 +150,27 @@ jobs:
       - name: Verify release assets
         run: (cd dist && sha256sum --check SHA256SUMS)
 
+      - name: Recheck tag before attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFIED_COMMIT: ${{ needs.build.outputs.release-commit }}
+          VERIFIED_TAG_OBJECT: ${{ needs.build.outputs.release-tag-object }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" == "$VERIFIED_COMMIT" || "$GITHUB_SHA" == "$VERIFIED_TAG_OBJECT" ]]
+          ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
+          jq -e --arg object "$VERIFIED_TAG_OBJECT" '
+            .object.type == "tag" and .object.sha == $object
+          ' <<<"$ref" >/dev/null
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${VERIFIED_TAG_OBJECT}")
+          jq -e --arg name "$GITHUB_REF_NAME" --arg object "$VERIFIED_TAG_OBJECT" \
+            --arg commit "$VERIFIED_COMMIT" '
+              .sha == $object and .tag == $name and
+              .object.type == "commit" and .object.sha == $commit and
+              .verification.verified == true and .verification.reason == "valid"
+            ' <<<"$tag" >/dev/null
+
       - name: Attest build provenance
         # v4.2.2
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
@@ -145,7 +181,7 @@ jobs:
 
   publish:
     name: Publish release
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [build, attest]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -165,7 +201,23 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERIFIED_COMMIT: ${{ needs.build.outputs.release-commit }}
+          VERIFIED_TAG_OBJECT: ${{ needs.build.outputs.release-tag-object }}
+        shell: bash
         run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" == "$VERIFIED_COMMIT" || "$GITHUB_SHA" == "$VERIFIED_TAG_OBJECT" ]]
+          ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")
+          jq -e --arg object "$VERIFIED_TAG_OBJECT" '
+            .object.type == "tag" and .object.sha == $object
+          ' <<<"$ref" >/dev/null
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${VERIFIED_TAG_OBJECT}")
+          jq -e --arg name "$GITHUB_REF_NAME" --arg object "$VERIFIED_TAG_OBJECT" \
+            --arg commit "$VERIFIED_COMMIT" '
+              .sha == $object and .tag == $name and
+              .object.type == "commit" and .object.sha == $commit and
+              .verification.verified == true and .verification.reason == "valid"
+            ' <<<"$tag" >/dev/null
           gh release create "$GITHUB_REF_NAME" \
             dist/pam-u2f-touch-popup-*.tar.gz \
             dist/SHA256SUMS \
@@ -173,4 +225,5 @@ jobs:
             --latest \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
+            --target "$VERIFIED_COMMIT" \
             --verify-tag

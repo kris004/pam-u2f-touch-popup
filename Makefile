@@ -38,7 +38,8 @@ check test: pam-u2f-touch-popup
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o "$$tmp/inotify-decoder" tests/inotify-decoder.c $(LDFLAGS); \
 	"$$tmp/inotify-decoder"; \
 	bash -n pam-u2f-touch-popup-setup; \
-	$(PYTHON) tests/setup.py ./pam-u2f-touch-popup-setup
+	$(PYTHON) tests/setup.py ./pam-u2f-touch-popup-setup; \
+	$(PYTHON) tests/release.py
 
 dist: pam-u2f-touch-popup
 	@test -n "$(VERSION)" || { echo "VERSION is required (for example, VERSION=v0.1.0)" >&2; exit 2; }

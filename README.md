@@ -25,6 +25,7 @@ no-device probes do not flash a dialog.
 - Linux with inotify support and procfs mounted at `/proc`
 - a C11 compiler and `make` to build
 - Python 3 to run the integration tests
+- jq to run the offline release-workflow regression tests
 - `pam_u2f` configured for the graphical-session user
 - Zenity installed at `/usr/bin/zenity`, or another absolute path selected at
   build time
@@ -174,7 +175,12 @@ unplug. Selection therefore does not depend on the popup delay.
 
 Use either installation workflow above to enable the gate. Run the setup command
 as the desktop user, not with sudo; it invokes sudo only to install the udev
-rule. A single connected FIDO model is selected automatically, while multiple
+rule and reload udev. The privileged operation uses a fixed `/bin/bash` with
+embedded setup code; command-specific sudo policies must permit this operation.
+It accepts only the operation and a normalized USB ID, reconstructs the rule in
+private root-owned staging, validates it when `udevadm verify` is available, and
+atomically replaces the managed rule. It never installs a user-owned rule file.
+A single connected FIDO model is selected automatically, while multiple
 models produce a numbered choice.
 
 An explicit USB ID also works when the key is not currently connected:
