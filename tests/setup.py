@@ -152,7 +152,26 @@ shift
 exec "$@"
 """,
         )
-        for name in ("mkdir", "mktemp", "chmod", "mv", "sync", "rm"):
+        # sync -f flushes the whole containing filesystem. Keep filesystem
+        # durability calls observable without flushing the host from fixtures.
+        self._write_executable(
+            "sync",
+            "#!/bin/bash -p\nset -euo pipefail\n"
+            f"readonly rule_dir={shlex.quote(str(self.rule.parent))}\n"
+            """[[ $# == 2 && $1 == -f ]]
+if [[ $2 == "${rule_dir}" ]]; then
+  [[ -d $2 && ! -L $2 ]]
+else
+  parent=${2%/*}
+  [[ ${parent%/*} == "${rule_dir}" &&
+     ${parent##*/} == .pam-u2f-touch-popup.???????? &&
+     ${2##*/} == 70-pam-u2f-touch-popup-device-gate.rules &&
+     -d ${parent} && ! -L ${parent} && -f $2 && ! -L $2 ]]
+fi
+printf 'sync %s\\n' "$*" >>"${PAM_TEST_COMMAND_LOG}"
+""",
+        )
+        for name in ("mkdir", "mktemp", "chmod", "mv", "rm"):
             real_command = shutil.which(name, path="/usr/bin:/bin")
             assert real_command is not None, name
             self._write_executable(
@@ -746,8 +765,36 @@ def test_enable_reconstructs_rule_after_unprivileged_replacement() -> None:
         verify_index = next(i for i, c in enumerate(commands) if c.startswith("udevadm verify /"))
         rename_index = next(i for i, c in enumerate(commands) if c.startswith("mv -fT -- "))
         reload_index = commands.index("udevadm control --reload")
-        assert verify_index < rename_index < reload_index
+        sync_indices = [i for i, c in enumerate(commands) if c.startswith("sync ")]
+        assert len(sync_indices) == 2, commands
+        staged_rule = commands[verify_index].removeprefix("udevadm verify ")
+        assert commands[sync_indices[0]] == f"sync -f {staged_rule}"
+        assert commands[sync_indices[1]] == f"sync -f {harness.rule.parent}"
+        assert verify_index < sync_indices[0] < rename_index < sync_indices[1] < reload_index
         assert str(old_rule) not in "\n".join(commands)
+
+
+def test_sync_fixture_rejects_unrelated_paths_and_arguments() -> None:
+    temporary_directory, harness = new_harness()
+    with temporary_directory:
+        unrelated = harness.root / "unrelated"
+        unrelated.write_text("fixture\n")
+        harness.rule.parent.mkdir(parents=True)
+        staging = harness.rule.parent / ".pam-u2f-touch-popup.12345678"
+        staging.mkdir()
+        symlink = staging / "70-pam-u2f-touch-popup-device-gate.rules"
+        symlink.symlink_to(unrelated)
+        for arguments in (
+            (), ("-f",), ("-f", str(harness.rule.parent), "extra"),
+            ("--file-system", str(harness.rule.parent)), ("-f", str(unrelated)),
+            ("-f", str(staging / "missing")), ("-f", str(symlink)),
+        ):
+            result = subprocess.run(
+                [str(harness.bin / "sync"), *arguments], env=harness.env,
+                text=True, capture_output=True, timeout=5, check=False,
+            )
+            assert result.returncode == 1, (arguments, result)
+            assert harness.commands() == []
 
 
 def test_validation_failure_preserves_existing_rule() -> None:
@@ -897,6 +944,7 @@ def main() -> int:
         test_resolvers_with_present_and_absent_optional_commands,
         test_helper_rejects_untrusted_arguments_before_commands,
         test_enable_reconstructs_rule_after_unprivileged_replacement,
+        test_sync_fixture_rejects_unrelated_paths_and_arguments,
         test_validation_failure_preserves_existing_rule,
         test_helper_rechecks_rule_after_sudo_boundary,
         test_missing_sudo_fixture_never_falls_back_to_real_sudo,
