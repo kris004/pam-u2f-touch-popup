@@ -619,35 +619,90 @@ def test_production_ignores_bash_startup_injection() -> None:
         assert not marker.exists()
 
 
-def test_production_resolvers_keep_fixed_executable_paths() -> None:
-    with tempfile.TemporaryDirectory(dir="/tmp") as tmp_string:
-        tmp = Path(tmp_string)
-        poisoned_bin = tmp / "bin"
-        poisoned_bin.mkdir()
-        marker = tmp / "poisoned-command-ran"
-        for name in ("bash", "install", "rm", "udevadm", "sudo"):
-            fake = poisoned_bin / name
-            fake.write_text(f"#!/bin/sh\nprintf ran >{shlex.quote(str(marker))}\nexit 99\n")
-            fake.chmod(0o755)
-        source = SETUP.read_text()
-        assert source.endswith('main "$@"\n')
-        outer = source.removesuffix('main "$@"\n')
-        inner = source.split("<<'PRIVILEGED_SETUP' || :\n", 1)[1]
-        inner = inner.split("(( EUID == 0 )) || die", 1)[0]
-        env = os.environ.copy()
-        env.update(PATH=str(poisoned_bin), PAM_U2F_TOUCH_POPUP_SETUP_TESTING="0")
-        probe = '\nfor name in bash install rm udevadm sudo; do find_command "$name" || :; done\n'
-        for definitions in (outer, inner):
+def production_resolver_definitions() -> tuple[str, str]:
+    source = SETUP.read_text()
+    assert source.endswith('main "$@"\n')
+    outer = source.removesuffix('main "$@"\n')
+    inner = source.split("<<'PRIVILEGED_SETUP' || :\n", 1)[1]
+    inner = inner.split("(( EUID == 0 )) || die", 1)[0]
+    return outer, inner
+
+
+def assert_resolvers_ignore_path(
+    definitions: tuple[str, str], root: Path, expected_paths: dict[str, Path | None],
+) -> None:
+    poisoned_bin = root / "poisoned-bin"
+    poisoned_bin.mkdir()
+    marker = root / "poisoned-command-ran"
+    for name in expected_paths:
+        fake = poisoned_bin / name
+        fake.write_text(f"#!/bin/sh\nprintf ran >{shlex.quote(str(marker))}\nexit 99\n")
+        fake.chmod(0o755)
+    env = os.environ.copy()
+    env.update(PATH=str(poisoned_bin), PAM_U2F_TOUCH_POPUP_SETUP_TESTING="0")
+    for resolver in definitions:
+        for name, expected in expected_paths.items():
+            # A missing command calls exit, so isolate each probe rather than
+            # letting an optional dependency terminate the complete check.
             result = subprocess.run(
-                ["/bin/bash", "-p", "-c", definitions + probe],
+                ["/bin/bash", "-p", "-c", resolver + '\nfind_command "$1"\n', "resolver-probe", name],
                 env=env, text=True, capture_output=True, timeout=5, check=False,
             )
-            assert result.returncode == 0, result.stderr
-            paths = result.stdout.splitlines()
-            assert paths
-            for path in paths:
-                assert Path(path).parent in tuple(Path(p) for p in ("/usr/bin", "/usr/sbin", "/bin", "/sbin")), path
+            if expected is None:
+                assert result.returncode == 1, (name, result)
+                assert result.stdout == "", (name, result.stdout)
+                assert result.stderr == f"error: required command not found in a system directory: {name}\n"
+            else:
+                assert result.returncode == 0, (name, result.stderr)
+                assert result.stdout == f"{expected}\n", (name, result.stdout)
+                assert result.stderr == "", (name, result.stderr)
             assert not marker.exists()
+
+
+def test_production_resolvers_keep_fixed_executable_paths() -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp_string:
+        directories = tuple(Path(p) for p in ("/usr/bin", "/usr/sbin", "/bin", "/sbin"))
+        expected_paths = {
+            name: next(
+                (directory / name for directory in directories
+                 if (directory / name).is_file() and os.access(directory / name, os.X_OK)),
+                None,
+            )
+            for name in ("bash", "install", "rm", "udevadm", "sudo")
+        }
+        assert_resolvers_ignore_path(production_resolver_definitions(), Path(tmp_string), expected_paths)
+
+
+def test_resolvers_with_present_and_absent_optional_commands() -> None:
+    # Model system directories only in disposable resolver fragments. No host
+    # packages change, and these probes never execute the resolved commands.
+    for optional in ((), ("udevadm",), ("sudo",), ("udevadm", "sudo")):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp_string:
+            root = Path(tmp_string)
+            directories = tuple(root / p for p in ("usr/bin", "usr/sbin", "bin", "sbin"))
+            for directory in directories:
+                directory.mkdir(parents=True)
+            expected_paths: dict[str, Path | None] = {}
+            for index, name in enumerate(("bash", "install", "rm", "udevadm", "sudo")):
+                expected_paths[name] = None
+                if name in ("udevadm", "sudo") and name not in optional:
+                    continue
+                # Cover later directories and prefer the first fixed candidate
+                # even when another executable exists in a later directory.
+                for directory in directories[index % len(directories):]:
+                    command = directory / name
+                    command.write_text("#!/bin/sh\nexit 99\n")
+                    command.chmod(0o755)
+                expected_paths[name] = directories[index % len(directories)] / name
+            outer, inner = production_resolver_definitions()
+            for system_directory, fixture_directory in zip(("/usr/bin", "/usr/sbin", "/bin", "/sbin"), directories):
+                original = f'"{system_directory}/${{name}}"'
+                replacement = f'{shlex.quote(str(fixture_directory))}/"${{name}}"'
+                assert outer.count(original) == 2, original
+                assert inner.count(original) == 1, original
+                outer = outer.replace(original, replacement)
+                inner = inner.replace(original, replacement)
+            assert_resolvers_ignore_path((outer, inner), root, expected_paths)
 
 
 def test_helper_rejects_untrusted_arguments_before_commands() -> None:
@@ -839,6 +894,7 @@ def main() -> int:
         test_production_and_distributed_artifacts_reject_testing,
         test_production_ignores_bash_startup_injection,
         test_production_resolvers_keep_fixed_executable_paths,
+        test_resolvers_with_present_and_absent_optional_commands,
         test_helper_rejects_untrusted_arguments_before_commands,
         test_enable_reconstructs_rule_after_unprivileged_replacement,
         test_validation_failure_preserves_existing_rule,
