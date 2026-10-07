@@ -39,6 +39,9 @@ fi
 readonly binary=${BINARY:-./pam-u2f-touch-popup}
 readonly output_dir=${OUTPUT_DIR:-dist}
 readonly release_ref=${RELEASE_REF:-HEAD}
+# Snapshot a mutable local ref once for both timestamp and source contents.
+release_commit=$(git rev-parse --verify "${release_ref}^{commit}")
+readonly release_commit
 readonly archive_root="${program}-${version}-${target}"
 readonly binary_archive="${archive_root}.tar.gz"
 readonly source_root="${program}-${version}"
@@ -47,7 +50,7 @@ readonly checksums='SHA256SUMS'
 
 source_date_epoch=${SOURCE_DATE_EPOCH:-}
 if [[ -z ${source_date_epoch} ]]; then
-  source_date_epoch=$(git show -s --format=%ct "${release_ref}^{commit}")
+  source_date_epoch=$(git show -s --format=%ct "${release_commit}")
 fi
 readonly source_date_epoch
 
@@ -94,7 +97,7 @@ tar \
 git archive \
   --format=tar \
   --prefix="${source_root}/" \
-  "${release_ref}" \
+  "${release_commit}" \
   | gzip -n >"${tmp_dir}/${source_archive}"
 
 (

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 set -euo pipefail
@@ -7,28 +7,23 @@ readonly program='pam-u2f-touch-popup'
 readonly default_service='pam-u2f-touch-popup.service'
 readonly device_path_unit='pam-u2f-touch-popup-device.path'
 readonly device_service='pam-u2f-touch-popup-device.service'
-readonly testing=${PAM_U2F_TOUCH_POPUP_SETUP_TESTING:-0}
-
-if [[ ${testing} == 1 ]]; then
-  readonly sys_class_hidraw=${PAM_U2F_TOUCH_POPUP_SYS_CLASS_HIDRAW:?}
-  readonly rule_path=${PAM_U2F_TOUCH_POPUP_RULE_PATH:?}
-  readonly marker_path=${PAM_U2F_TOUCH_POPUP_MARKER_PATH:?}
-  [[ ${sys_class_hidraw} == /tmp/* ]] || exit 2
-  [[ ${rule_path} == /tmp/* ]] || exit 2
-  [[ ${marker_path} == /tmp/* ]] || exit 2
-else
-  readonly sys_class_hidraw='/sys/class/hidraw'
-  readonly rule_path='/etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules'
-  readonly marker_path='/dev/pam-u2f-touch-popup-key'
+# Test dependency injection belongs only in generated, non-elevating fixtures.
+if [[ ${PAM_U2F_TOUCH_POPUP_SETUP_TESTING:-0} != 0 ]]; then
+  printf '%s\n' 'error: runtime setup testing is not supported' >&2
+  exit 2
 fi
+readonly sys_class_hidraw='/sys/class/hidraw'
+readonly sys_devices='/sys/devices'
+readonly rule_path='/etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules'
+readonly marker_path='/dev/pam-u2f-touch-popup-key'
 
 declare -a device_ids=()
 declare -a device_labels=()
 selected_device_id=
-temp_dir=
 
 usage() {
-  cat <<'EOF'
+  local help_text
+  IFS= read -r -d '' help_text <<'EOF' || :
 Usage:
   pam-u2f-touch-popup-setup list
   pam-u2f-touch-popup-setup enable [--yes] [VENDOR_ID:PRODUCT_ID]
@@ -44,6 +39,7 @@ Commands:
 Run this command as the desktop user, not with sudo. The enable and disable
 commands invoke sudo only for the system udev rule.
 EOF
+  printf '%s\n' "${help_text}"
 }
 
 die() {
@@ -55,29 +51,9 @@ warn() {
   printf 'warning: %s\n' "$*" >&2
 }
 
-cleanup() {
-  local rm_cmd
-
-  if [[ -n ${temp_dir} ]]; then
-    rm_cmd=$(find_command rm)
-    "${rm_cmd}" -rf -- "${temp_dir}"
-  fi
-}
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
 find_command() {
   local name=$1
   local path
-
-  if [[ ${testing} == 1 ]]; then
-    path=$(command -v -- "${name}") || die "required command not found: ${name}"
-    [[ ${path} == /* ]] || die "command does not resolve to an absolute path: ${name}"
-    printf '%s\n' "${path}"
-    return
-  fi
 
   for path in \
     "/usr/bin/${name}" \
@@ -104,14 +80,13 @@ sanitize_label() {
   local label=$1
 
   label=${label//_/ }
-  label=${label//$'\t'/ }
-  label=${label//$'\r'/ }
+  label=${label//[[:cntrl:]]/ }
   printf '%s\n' "${label}"
 }
 
 discover_devices() {
   local udevadm_cmd=$1
-  local sysdev properties property value
+  local sysdev parent usb_parent kernel_properties properties property value
   local fido vendor_id product_id vendor_name model_name id label
   local existing known
 
@@ -139,6 +114,44 @@ discover_devices() {
     done <<<"${properties}"
 
     [[ ${fido} == 1 ]] || continue
+    # Some udev distributions identify FIDO hidraw nodes without importing
+    # USB identity properties. Read both IDs from the same kernel USB parent.
+    if [[ ! ${vendor_id} =~ ^[0-9A-Fa-f]{4}$ ||
+          ! ${product_id} =~ ^[0-9A-Fa-f]{4}$ ]]; then
+      parent=$(cd -P -- "${sysdev}/device" 2>/dev/null && pwd -P) || continue
+      vendor_id=
+      product_id=
+      while [[ ${parent} == "${sys_devices}"/* ]]; do
+        [[ -d ${parent} && -r ${parent}/uevent ]] || break
+        if ! kernel_properties=$(<"${parent}/uevent") || [[ -z ${kernel_properties} ]]; then
+          break
+        fi
+        usb_parent=false
+        while IFS='=' read -r property value; do
+          if [[ ${property} == DEVTYPE && ${value} == usb_device ]]; then
+            usb_parent=true
+          fi
+        done <<<"${kernel_properties}"
+        if [[ ${usb_parent} == true ]]; then
+          # Missing key attributes must not select an upstream USB hub.
+          [[ -r ${parent}/idVendor && -r ${parent}/idProduct ]] || break
+          if ! { IFS= read -r vendor_id <"${parent}/idVendor" &&
+                 IFS= read -r product_id <"${parent}/idProduct"; }; then
+            vendor_id=
+            product_id=
+            break
+          fi
+          if [[ -z ${vendor_name} && -r ${parent}/manufacturer ]]; then
+            IFS= read -r vendor_name <"${parent}/manufacturer" || vendor_name=
+          fi
+          if [[ -z ${model_name} && -r ${parent}/product ]]; then
+            IFS= read -r model_name <"${parent}/product" || model_name=
+          fi
+          break
+        fi
+        parent=${parent%/*}
+      done
+    fi
     [[ ${vendor_id} =~ ^[0-9A-Fa-f]{4}$ ]] || continue
     [[ ${product_id} =~ ^[0-9A-Fa-f]{4}$ ]] || continue
     id="${vendor_id,,}:${product_id,,}"
@@ -238,53 +251,113 @@ rule_is_related() {
   return 1
 }
 
-create_rule() {
-  local device_id=$1
-  local mktemp_cmd=$2
-  local vendor_id=${device_id%:*}
-  local product_id=${device_id#*:}
+privileged_setup() {
+  local sudo_cmd=$1
+  local code
+  shift
 
-  temp_dir=$("${mktemp_cmd}" -d)
-  generated_rule="${temp_dir}/70-pam-u2f-touch-popup-device-gate.rules"
-  cat >"${generated_rule}" <<EOF
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Managed by ${program}-setup. Manual edits may be replaced.
-# Match every FIDO authenticator with USB ID ${device_id}.
+  # Pass constant code as an argument, never a user-owned script/rule pathname
+  # or stdin. Only the operation and normalized USB ID cross this boundary.
+  IFS= read -r -d '' code <<'PRIVILEGED_SETUP' || :
+set -euo pipefail
+# System directories stay traversable; private staging below uses umask 077.
+umask 022
+readonly rule_dir='/etc/udev/rules.d'
+readonly rule_path='/etc/udev/rules.d/70-pam-u2f-touch-popup-device-gate.rules'
+temp_dir=
 
-SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ENV{ID_FIDO_TOKEN}=="1", \\
-  ATTRS{idVendor}=="${vendor_id}", ATTRS{idProduct}=="${product_id}", TAG+="systemd", \\
-  SYMLINK+="pam-u2f-touch-popup-key", \\
-  ENV{SYSTEMD_ALIAS}+="/dev/pam-u2f-touch-popup-key"
-EOF
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+find_command() {
+  local name=$1 path
+  for path in "/usr/bin/${name}" "/usr/sbin/${name}" "/bin/${name}" "/sbin/${name}"; do
+    if [[ -f ${path} && -x ${path} ]]; then
+      printf '%s\n' "${path}"
+      return
+    fi
+  done
+  die "required command not found in a system directory: ${name}"
+}
+rule_is_related() {
+  local line
+  [[ ! -L ${rule_path} && -f ${rule_path} && -r ${rule_path} ]] || return 1
+  while IFS= read -r line; do
+    [[ ${line} == *'SYMLINK+="pam-u2f-touch-popup-key"'* ]] && return 0
+  done <"${rule_path}"
+  return 1
+}
+cleanup() {
+  if [[ -n ${temp_dir} ]]; then
+    "${rm_cmd}" -rf -- "${temp_dir}"
+  fi
 }
 
-validate_rule() {
-  local udevadm_cmd=$1
-  local output
+(( EUID == 0 )) || die 'the privileged setup operation requires root'
+case ${1-} in
+  enable)
+    (( $# == 2 )) || die 'enable requires one normalized USB ID'
+    [[ $2 =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]] || die 'invalid normalized USB ID'
+    ;;
+  disable) (( $# == 1 )) || die 'disable does not accept arguments' ;;
+  *) die 'unknown privileged setup operation' ;;
+esac
 
+if [[ -e ${rule_path} || -L ${rule_path} ]] && ! rule_is_related; then
+  die "${rule_path} exists but is not a pam-u2f-touch-popup device-gate rule"
+fi
+rm_cmd=$(find_command rm)
+udevadm_cmd=$(find_command udevadm)
+
+if [[ $1 == enable ]]; then
+  device_id=$2
+  vendor_id=${device_id%:*}
+  product_id=${device_id#*:}
+  mkdir_cmd=$(find_command mkdir)
+  mktemp_cmd=$(find_command mktemp)
+  chmod_cmd=$(find_command chmod)
+  mv_cmd=$(find_command mv)
+  sync_cmd=$(find_command sync)
+  "${mkdir_cmd}" -p -- "${rule_dir}"
+  umask 077
+  # Private root-owned staging on the destination filesystem binds validation
+  # to the bytes atomically renamed into place, without a same-UID source race.
+  temp_dir=$("${mktemp_cmd}" -d "${rule_dir}/.pam-u2f-touch-popup.XXXXXXXX")
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  generated_rule="${temp_dir}/70-pam-u2f-touch-popup-device-gate.rules"
+  printf '%s\n' \
+    '# SPDX-License-Identifier: GPL-3.0-or-later' \
+    '# Managed by pam-u2f-touch-popup-setup. Manual edits may be replaced.' \
+    "# Match every FIDO authenticator with USB ID ${device_id}." \
+    '' \
+    "SUBSYSTEM==\"hidraw\", KERNEL==\"hidraw*\", ENV{ID_FIDO_TOKEN}==\"1\", \\" \
+    "  ATTRS{idVendor}==\"${vendor_id}\", ATTRS{idProduct}==\"${product_id}\", TAG+=\"systemd\", \\" \
+    "  SYMLINK+=\"pam-u2f-touch-popup-key\", \\" \
+    '  ENV{SYSTEMD_ALIAS}+="/dev/pam-u2f-touch-popup-key"' >"${generated_rule}"
+  "${chmod_cmd}" 0644 -- "${generated_rule}"
   if "${udevadm_cmd}" verify --help >/dev/null 2>&1; then
     if ! output=$("${udevadm_cmd}" verify "${generated_rule}" 2>&1); then
       printf '%s\n' "${output}" >&2
       die 'generated udev rule failed validation'
     fi
   fi
-}
+  "${sync_cmd}" -f "${generated_rule}"
+  "${mv_cmd}" -fT -- "${generated_rule}" "${rule_path}"
+  "${sync_cmd}" -f "${rule_dir}"
+else
+  "${rm_cmd}" -f -- "${rule_path}"
+fi
 
-reload_hidraw_devices() {
-  local sudo_cmd=$1
-  local udevadm_cmd=$2
-
-  if ! "${sudo_cmd}" -- "${udevadm_cmd}" control --reload; then
-    die "the rule was changed, but udev could not reload it"
-  fi
-  if ! "${sudo_cmd}" -- "${udevadm_cmd}" trigger \
-    --action=change --subsystem-match=hidraw; then
-    warn 'udev was reloaded, but existing hidraw devices could not be retriggered; reconnect the selected key'
-    return
-  fi
-  if ! "${sudo_cmd}" -- "${udevadm_cmd}" settle; then
-    warn 'udev did not settle cleanly; reconnect the selected key if the gate marker is absent'
-  fi
+"${udevadm_cmd}" control --reload || die 'the rule was changed, but udev could not reload it'
+if ! "${udevadm_cmd}" trigger --action=change --subsystem-match=hidraw; then
+  warn 'udev was reloaded, but existing hidraw devices could not be retriggered; reconnect the selected key'
+elif ! "${udevadm_cmd}" settle; then
+  warn 'udev did not settle cleanly; reconnect the selected key if the gate marker is absent'
+fi
+PRIVILEGED_SETUP
+  "${sudo_cmd}" -- /bin/bash -p -c "${code}" "${program}-setup" "$@"
 }
 
 unit_state() {
@@ -333,7 +406,7 @@ command_status() {
 command_enable() {
   local assume_yes=false
   local requested_id=
-  local arg systemctl_cmd udevadm_cmd sudo_cmd install_cmd mktemp_cmd
+  local arg systemctl_cmd udevadm_cmd sudo_cmd
   local restart_device_service=false
 
   selected_device_id=
@@ -352,8 +425,6 @@ command_enable() {
   systemctl_cmd=$(find_command systemctl)
   udevadm_cmd=$(find_command udevadm)
   sudo_cmd=$(find_command sudo)
-  install_cmd=$(find_command install)
-  mktemp_cmd=$(find_command mktemp)
   systemctl_user "${systemctl_cmd}" daemon-reload
   systemctl_user "${systemctl_cmd}" cat "${device_path_unit}" >/dev/null 2>&1 || \
     die "${device_path_unit} is not installed"
@@ -376,11 +447,7 @@ command_enable() {
   confirm_or_exit "${assume_yes}" \
     "Enable the popup for every FIDO authenticator matching ${selected_device_id}?"
 
-  create_rule "${selected_device_id}" "${mktemp_cmd}"
-  validate_rule "${udevadm_cmd}"
-  "${sudo_cmd}" -v
-  "${sudo_cmd}" -- "${install_cmd}" -Dm0644 "${generated_rule}" "${rule_path}"
-  reload_hidraw_devices "${sudo_cmd}" "${udevadm_cmd}"
+  privileged_setup "${sudo_cmd}" enable "${selected_device_id}"
 
   if ! systemctl_user "${systemctl_cmd}" disable --now "${default_service}"; then
     die "the udev rule remains installed, but ${default_service} could not be disabled"
@@ -402,7 +469,7 @@ command_enable() {
 
 command_disable() {
   local assume_yes=false
-  local arg systemctl_cmd udevadm_cmd sudo_cmd rm_cmd
+  local arg systemctl_cmd sudo_cmd
 
   for arg in "$@"; do
     case ${arg} in
@@ -427,12 +494,8 @@ command_disable() {
   fi
 
   if [[ -e ${rule_path} ]]; then
-    udevadm_cmd=$(find_command udevadm)
     sudo_cmd=$(find_command sudo)
-    rm_cmd=$(find_command rm)
-    "${sudo_cmd}" -v
-    "${sudo_cmd}" -- "${rm_cmd}" -f -- "${rule_path}"
-    reload_hidraw_devices "${sudo_cmd}" "${udevadm_cmd}"
+    privileged_setup "${sudo_cmd}" disable
   fi
 
   printf '%s\n' 'Device gating disabled; the default popup service is enabled.'
@@ -449,7 +512,7 @@ main() {
       ;;
   esac
 
-  if [[ ${testing} != 1 ]] && (( EUID == 0 )); then
+  if (( EUID == 0 )); then
     die 'run this command as the desktop user, not with sudo'
   fi
   [[ -n ${command} ]] || {
